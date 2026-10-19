@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <algorithm>
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
@@ -29,6 +30,7 @@
 
 #include "VrRuntimeAndroid.h"
 #include "WindowSystem.h"
+#include "config/CemuConfig.h"
 
 #define LOG_TAG "CemuVR"
 
@@ -743,6 +745,14 @@ namespace VrRuntime
 	{
 		if (!g.initialized || g.sessionCreated)
 			return;
+
+		// Presentation resolution for both the emulator color images and the XR
+		// swapchain. This makes the virtual screen sharper; the game's own
+		// render targets only gain real detail from a resolution graphic pack.
+		const sint32 renderScale = std::clamp(GetConfig().vr_render_scale.GetValue(), 100, 200);
+		g.extent.width = ((1280u * static_cast<uint32>(renderScale)) / 100u + 1u) & ~1u;
+		g.extent.height = ((720u * static_cast<uint32>(renderScale)) / 100u + 1u) & ~1u;
+		LOGI("VR render scale: %d%% (%ux%u)", renderScale, g.extent.width, g.extent.height);
 
 		// The runtime requires this query before xrCreateSession and the returned
 		// physical device must be the one used for the session binding.

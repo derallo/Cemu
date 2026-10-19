@@ -17,6 +17,13 @@ private val ScalingFilterChoices = listOf(
     NativeSettings.ScalingFilter.NEAREST_NEIGHBOR_FILTER
 )
 
+private val VrRenderScaleChoices = listOf(
+    NativeSettings.VrRenderScale.PERCENT_100,
+    NativeSettings.VrRenderScale.PERCENT_125,
+    NativeSettings.VrRenderScale.PERCENT_150,
+    NativeSettings.VrRenderScale.PERCENT_200
+)
+
 @Composable
 fun GraphicsSettingsScreen(navigateBack: () -> Unit, goToCustomDriversSettings: () -> Unit) {
     val supportsLoadingCustomDrivers = remember { NativeEmulation.supportsLoadingCustomDriver() }
@@ -65,6 +72,13 @@ fun GraphicsSettingsScreen(navigateBack: () -> Unit, goToCustomDriversSettings: 
             ),
         )
         SingleSelection(
+            label = tr("VR resolution"),
+            initialChoice = NativeSettings::getVrRenderScale,
+            onChoiceChanged = NativeSettings::setVrRenderScale,
+            choiceToString = { vrRenderScaleToString(it) },
+            choices = VrRenderScaleChoices,
+        )
+        SingleSelection(
             label = tr("Upscale filter"),
             initialChoice = NativeSettings::getUpscalingFilter,
             onChoiceChanged = NativeSettings::setUpscalingFilter,
@@ -79,6 +93,14 @@ fun GraphicsSettingsScreen(navigateBack: () -> Unit, goToCustomDriversSettings: 
             choices = ScalingFilterChoices,
         )
     }
+}
+
+private fun vrRenderScaleToString(scale: Int) = when (scale) {
+    NativeSettings.VrRenderScale.PERCENT_100 -> tr("Standard (720p)")
+    NativeSettings.VrRenderScale.PERCENT_125 -> tr("125% (900p)")
+    NativeSettings.VrRenderScale.PERCENT_150 -> tr("150% (1080p)")
+    NativeSettings.VrRenderScale.PERCENT_200 -> tr("200% (1440p)")
+    else -> throw IllegalArgumentException("Invalid VR render scale: $scale")
 }
 
 private fun scalingFilterToString(scalingFilter: Int) = when (scalingFilter) {

@@ -3,6 +3,8 @@
 #include "config/CemuConfig.h"
 #include "config/NetworkSettings.h"
 
+#include <algorithm>
+
 extern "C" [[maybe_unused]] JNIEXPORT jint JNICALL
 Java_info_cemu_cemu_nativeinterface_NativeSettings_getOverlayPosition([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
 {
@@ -259,6 +261,18 @@ extern "C" [[maybe_unused]] JNIEXPORT jint JNICALL
 Java_info_cemu_cemu_nativeinterface_NativeSettings_getFullscreenScaling([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
 {
 	return GetConfig().fullscreen_scaling;
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeSettings_setVrRenderScale([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz, jint scale)
+{
+	GetConfig().vr_render_scale = std::clamp(static_cast<sint32>(scale), 100, 200);
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT jint JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeSettings_getVrRenderScale([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
+{
+	return GetConfig().vr_render_scale;
 }
 
 extern "C" [[maybe_unused]] JNIEXPORT void JNICALL

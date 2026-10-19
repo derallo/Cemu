@@ -499,6 +499,10 @@ struct CemuConfig
 	ConfigValue<sint32> upscale_filter{kBicubicFilter};
 	ConfigValue<sint32> downscale_filter{kLinearFilter};
 	ConfigValue<sint32> fullscreen_scaling{kKeepAspectRatio};
+	// VR presentation resolution as a percentage of the 1280x720 default
+	// (100 = 720p, 125 = 900p, 150 = 1080p, 200 = 1440p). Only used by the
+	// Android/OpenXR renderer.
+	ConfigValue<sint32> vr_render_scale{100};
 
 	// audio
 	sint32 audio_api = 0;
