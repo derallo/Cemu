@@ -109,6 +109,13 @@ private fun MainNav() {
     }
 }
 
+private fun isQuestHeadset(): Boolean {
+    val manufacturer = android.os.Build.MANUFACTURER
+    val model = android.os.Build.MODEL
+    return manufacturer.equals("Oculus", ignoreCase = true) ||
+        model.contains("Quest", ignoreCase = true)
+}
+
 private fun createIntentForGame(context: Context, game: Game): Intent {
     val intent = Intent(
         context, EmulationActivity::class.java
@@ -130,6 +137,13 @@ private fun startGameInVr(context: Context, game: Game) {
 
 private fun startGame(context: Context, game: Game) {
     NativeSettings.saveSettings()
+
+    // Horizon OS panel windows do not composite the SurfaceView that the 2D
+    // renderer needs, so Quest headsets always launch into the VR activity.
+    if (isQuestHeadset()) {
+        startGameInVr(context, game)
+        return
+    }
 
     val intent = createIntentForGame(context, game)
     context.startActivity(intent)
