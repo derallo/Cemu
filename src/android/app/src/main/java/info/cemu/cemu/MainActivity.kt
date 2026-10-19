@@ -58,6 +58,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (intent?.getBooleanExtra("vrprobe", false) == true) {
+            info.cemu.cemu.nativeinterface.VrProbe.startProbe(this)
+        }
         setContent {
             TranslatableContent {
                 ActivityContent {

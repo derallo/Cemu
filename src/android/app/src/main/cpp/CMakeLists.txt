@@ -17,13 +17,19 @@ add_library(CemuAndroid SHARED
         NativeLogging.cpp
         NativeSettings.cpp
         NativeSwkbd.cpp
+        VrProbe.cpp
         WuaConverter.cpp
 )
 
 cemu_use_precompiled_header(CemuAndroid)
 
+target_include_directories(CemuAndroid PRIVATE
+        ${CMAKE_SOURCE_DIR}/dependencies/OpenXR/include
+)
+
 target_link_libraries(CemuAndroid PRIVATE
         -landroid
+        ${CMAKE_SOURCE_DIR}/dependencies/OpenXR/lib/${ANDROID_ABI}/libopenxr_loader.so
         CemuCommon
         CemuAudio
         CemuComponents

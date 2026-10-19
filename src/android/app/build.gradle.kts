@@ -44,6 +44,9 @@ android {
     namespace = "info.cemu.cemu"
     compileSdk = 36
     ndkVersion = "29.0.14206865"
+    // The host SDK is read-only in some sandboxes, so allow pointing at an
+    // NDK installed elsewhere (see scripts/build-android.sh).
+    System.getenv("CEMU_NDK_PATH")?.let { ndkPath = it }
     defaultConfig {
         applicationId = "info.cemu.cemu"
         minSdk = 30
@@ -61,6 +64,7 @@ android {
         assets {
             directories.add(cemuDataFilesFolder)
         }
+        jniLibs.srcDir("../../../../dependencies/OpenXR/lib")
     }
 
     packaging {

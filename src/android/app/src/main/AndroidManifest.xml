@@ -5,6 +5,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Quest headsets have no touchscreen; without this the app is treated as
+         requiring one and some stores/launchers hide it. -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
     <uses-feature
         android:name="android.hardware.vulkan.version"
         android:required="true"
@@ -32,7 +38,7 @@
         </activity>
         <activity
             android:name=".emulation.EmulationActivity"
-            android:configChanges="orientation|screenSize"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density"
             android:exported="true"
             android:launchMode="singleTop"
             android:parentActivityName=".MainActivity"
