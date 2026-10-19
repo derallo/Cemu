@@ -7,11 +7,9 @@ import androidx.lifecycle.lifecycleScope
 import info.cemu.cemu.MainActivity
 import info.cemu.cemu.nativeinterface.NativeEmulation
 import info.cemu.cemu.nativeinterface.NativeVr
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.system.exitProcess
 
@@ -24,7 +22,8 @@ class EmulationVrActivity : EmulationActivity() {
     /** True once this instance actually started a title (not the launcher tile). */
     private var runsEmulation = false
 
-    private var teardownThread: Thread? = null
+    /** Guards against a second teardown from onDestroy after the exit gesture. */
+    private val teardownStarted = AtomicBoolean(false)
 
     override fun isVrMode(): Boolean = true
 
@@ -63,53 +62,58 @@ class EmulationVrActivity : EmulationActivity() {
      * Cemu's Android core has no background teardown of its own: if the activity
      * merely finishes, the emulation threads keep running at ~200% CPU and keep
      * /vol/content mounted, so the next launch dies with
-     * "fsc_mount failed (virtual path: /vol/content/)". Stop the title before
-     * leaving the activity.
+     * "fsc_mount failed (virtual path: /vol/content/)". Stop the title, then end
+     * the process.
+     *
+     * Ending the process is deliberate, not a workaround for missing cleanup:
+     * Horizon OS does not grant XR_SESSION_STATE_READY to a second
+     * xrCreateSession in the same process, so an in-process relaunch creates a
+     * session that stays IDLE forever (audio without video). A fresh process per
+     * VR session is the only reliable lifecycle.
      */
     private fun stopEmulation() {
         if (!teardownStarted.compareAndSet(false, true)) {
             return
         }
-        val thread = Thread({
+
+        // Never leave a wedged emulator holding the CPU: if the graceful
+        // teardown does not finish, force the process down anyway.
+        Thread({
+            Thread.sleep(TEARDOWN_TIMEOUT_MS)
+            Log.w(TAG, "teardown timed out; forcing process exit")
+            Runtime.getRuntime().halt(0)
+        }, "cemu-vr-teardown-watchdog").also {
+            it.isDaemon = true
+            it.start()
+        }
+
+        Thread({
             try {
                 // Order matters: the session is bound to the VkDevice that
                 // shutdownTitle() destroys.
                 NativeVr.shutdown()
                 NativeEmulation.shutdownTitle()
             } catch (t: Throwable) {
-                Log.e("CemuVr", "failed to stop emulation", t)
-            }
-        }, "cemu-vr-teardown")
-        thread.isDaemon = true
-        teardownThread = thread
-        thread.start()
-    }
-
-    private fun stopEmulationAndFinish() {
-        stopEmulation()
-        lifecycleScope.launch {
-            // Never keep the player stuck if the emulator refuses to shut down.
-            val finished = withContext(Dispatchers.IO) {
-                val thread = teardownThread
-                thread?.join(3000)
-                thread?.isAlive != true
-            }
-            if (finished) {
-                finish()
-            } else {
-                // A half-stopped emulator would break the next launch; restart
-                // the process instead.
+                Log.e(TAG, "failed to stop emulation", t)
+            } finally {
+                Log.i(TAG, "teardown complete; exiting process")
                 exitProcess(0)
             }
+        }, "cemu-vr-teardown").also {
+            it.isDaemon = false
+            it.start()
         }
     }
 
+    private fun stopEmulationAndFinish() {
+        // Detach the task first so the player lands back in the library instead
+        // of on a black activity while the teardown thread runs.
+        finishAndRemoveTask()
+        stopEmulation()
+    }
+
     companion object {
-        /**
-         * Process-wide: two activity instances can tear down at once (e.g. the
-         * task is cleared while a second instance starts), and a double
-         * ShutdownTitle() aborts the process.
-         */
-        private val teardownStarted = AtomicBoolean(false)
+        private const val TAG = "CemuVr"
+        private const val TEARDOWN_TIMEOUT_MS = 6_000L
     }
 }
