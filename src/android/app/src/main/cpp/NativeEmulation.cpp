@@ -19,6 +19,8 @@
 
 #include <android/native_window_jni.h>
 
+#include <mutex>
+
 // forward declaration from main.cpp
 void CemuCommonInit();
 
@@ -222,6 +224,17 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulation_setReplaceTVWithPadView([[ma
 {
 	// Emulate pressing the TAB key for showing DRC instead of TV
 	WindowSystem::GetWindowInfo().set_keystate(static_cast<uint32>(WindowSystem::PlatformKeyCodes::TAB), swapped);
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeEmulation_shutdownTitle([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
+{
+	// Stops the emulation threads and unmounts the title. Without this the
+	// emulator keeps running after the VR activity closes and the next launch
+	// fails because /vol/content (and the MLC) are still mounted.
+	static std::mutex shutdownMutex;
+	std::scoped_lock lock(shutdownMutex);
+	CafeSystem::ShutdownTitle();
 }
 
 extern "C" [[maybe_unused]] JNIEXPORT void JNICALL

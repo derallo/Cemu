@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "VrRuntimeAndroid.h"
+#include "WindowSystem.h"
 
 #define LOG_TAG "CemuVR"
 
@@ -74,6 +75,12 @@ namespace
 
 namespace
 {
+	// Virtual screen geometry in LOCAL space. The touch pointer below maps the
+	// controller ray onto the same rectangle, so keep both in sync.
+	constexpr float kQuadWidth = 2.4f;
+	constexpr float kQuadHeight = 1.35f;
+	constexpr float kQuadZ = -2.0f;
+
 	struct VrState
 	{
 		bool initialized = false;
@@ -120,6 +127,13 @@ namespace
 		VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 		VkFence frameFence = VK_NULL_HANDLE;
 
+		// 2x1-pixel solid images used to draw the "where am I pointing" cursor
+		// (black ring + white centre) straight into the presented frame.
+		VkImage cursorImageBlack = VK_NULL_HANDLE;
+		VkDeviceMemory cursorMemoryBlack = VK_NULL_HANDLE;
+		VkImage cursorImageWhite = VK_NULL_HANDLE;
+		VkDeviceMemory cursorMemoryWhite = VK_NULL_HANDLE;
+
 		XrActionSet actionSet = XR_NULL_HANDLE;
 		XrAction triggerLeft = XR_NULL_HANDLE;
 		XrAction triggerRight = XR_NULL_HANDLE;
@@ -134,11 +148,31 @@ namespace
 		XrAction menuButton = XR_NULL_HANDLE;
 		XrAction stickClickLeft = XR_NULL_HANDLE;
 		XrAction stickClickRight = XR_NULL_HANDLE;
+		XrAction aimPoseLeft = XR_NULL_HANDLE;
+		XrAction aimPoseRight = XR_NULL_HANDLE;
+
+		XrSpace aimSpaceLeft = XR_NULL_HANDLE;
+		XrSpace aimSpaceRight = XR_NULL_HANDLE;
 
 		bool controllerInitialized = false;
 		bool exitChordLatched = false;
 		bool userExitRequested = false;
 		std::atomic_int lastSyncResult{0};
+
+		// Virtual touchscreen ("stylus") driven by the right controller.
+		bool touchActive = false;
+		sint32 touchX = 0;
+		sint32 touchY = 0;
+
+		// Right-controller ray hit on the virtual screen (0..1), valid when
+		// pointerOnScreen is true.
+		bool pointerOnScreen = false;
+		float pointerU = 0.0f;
+		float pointerV = 0.0f;
+		bool screenIsGamePad = true; // GamePad (DRC) instead of TV
+		bool viewChordLatched = false;
+		bool viewChordFired = false;
+		std::chrono::steady_clock::time_point viewChordStart{};
 	};
 
 	VrState g;
@@ -248,6 +282,8 @@ namespace
 		if (!CreateAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "menu", "Menu", g.menuButton)) return false;
 		if (!CreateAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "stick_click_left", "Left stick click", g.stickClickLeft)) return false;
 		if (!CreateAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "stick_click_right", "Right stick click", g.stickClickRight)) return false;
+		if (!CreateAction(XR_ACTION_TYPE_POSE_INPUT, "aim_pose_left", "Left aim", g.aimPoseLeft)) return false;
+		if (!CreateAction(XR_ACTION_TYPE_POSE_INPUT, "aim_pose_right", "Right aim", g.aimPoseRight)) return false;
 
 		XrPath touchProfile = XR_NULL_PATH;
 		XrPath leftHand = XR_NULL_PATH, rightHand = XR_NULL_PATH;
@@ -270,6 +306,8 @@ namespace
 			{g.buttonB, "/user/hand/right/input/b/click"},
 			{g.buttonX, "/user/hand/left/input/x/click"},
 			{g.buttonY, "/user/hand/left/input/y/click"},
+			{g.aimPoseLeft, "/user/hand/left/input/aim/pose"},
+			{g.aimPoseRight, "/user/hand/right/input/aim/pose"},
 		};
 
 		std::vector<XrActionSuggestedBinding> bindings;
@@ -292,6 +330,14 @@ namespace
 		(void)leftHand;
 		(void)rightHand;
 		return XrOk(xrSuggestInteractionProfileBindings(g.instance, &suggested), "xrSuggestInteractionProfileBindings");
+	}
+
+	void ApplyScreenView()
+	{
+		// Cemu treats the TAB key as "replace TV with the GamePad (DRC) view".
+		WindowSystem::GetWindowInfo().set_keystate(
+			static_cast<uint32>(WindowSystem::PlatformKeyCodes::TAB), g.screenIsGamePad);
+		LOGI("VR screen: %s", g.screenIsGamePad ? "GamePad" : "TV");
 	}
 
 	bool CreateSession()
@@ -320,6 +366,21 @@ namespace
 		attachInfo.actionSets = &g.actionSet;
 		if (!XrOk(xrAttachSessionActionSets(g.session, &attachInfo), "xrAttachSessionActionSets"))
 			return false;
+
+		auto createAimSpace = [](XrAction action, XrSpace& space, const char* name)
+		{
+			XrActionSpaceCreateInfo spaceCreate{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+			spaceCreate.action = action;
+			spaceCreate.poseInActionSpace.orientation.w = 1.0f;
+			if (!XrOk(xrCreateActionSpace(g.session, &spaceCreate, &space), name))
+				space = XR_NULL_HANDLE;
+		};
+		createAimSpace(g.aimPoseLeft, g.aimSpaceLeft, "xrCreateActionSpace(aim left)");
+		createAimSpace(g.aimPoseRight, g.aimSpaceRight, "xrCreateActionSpace(aim right)");
+
+		// The VR port only shows one screen; default to the GamePad view so the
+		// touch pointer lines up with what the player sees.
+		ApplyScreenView();
 
 		g.sessionCreated = true;
 		LOGI("OpenXR session created");
@@ -377,6 +438,12 @@ namespace
 
 	bool CreateColorImages()
 	{
+		// The previous run's images belong to a VkDevice that no longer exists;
+		// keeping them here hands stale handles to the renderer (driver crash in
+		// vkCreateImageView on the next launch).
+		g.colorImages.clear();
+		g.colorMemories.clear();
+
 		VkPhysicalDeviceMemoryProperties memoryProperties;
 		vkGetPhysicalDeviceMemoryProperties(g.vkPhysicalDevice, &memoryProperties);
 
@@ -435,6 +502,86 @@ namespace
 		return true;
 	}
 
+	bool CreateSolidCursorImage(VkImage& image, VkDeviceMemory& memory, float red, float green, float blue)
+	{
+		VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		info.imageType = VK_IMAGE_TYPE_2D;
+		// Must match the swapchain so vkCmdBlitImage stays format-compatible.
+		info.format = g.colorFormat;
+		info.extent = {1, 1, 1};
+		info.mipLevels = 1;
+		info.arrayLayers = 1;
+		info.samples = VK_SAMPLE_COUNT_1_BIT;
+		info.tiling = VK_IMAGE_TILING_OPTIMAL;
+		info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		if (vkCreateImage(g.vkDevice, &info, nullptr, &image) != VK_SUCCESS)
+			return false;
+
+		VkMemoryRequirements requirements;
+		vkGetImageMemoryRequirements(g.vkDevice, image, &requirements);
+		VkPhysicalDeviceMemoryProperties memoryProperties;
+		vkGetPhysicalDeviceMemoryProperties(g.vkPhysicalDevice, &memoryProperties);
+		uint32_t memoryType = UINT32_MAX;
+		for (uint32_t t = 0; t < memoryProperties.memoryTypeCount; t++)
+		{
+			if ((requirements.memoryTypeBits & (1u << t)) &&
+				(memoryProperties.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+			{
+				memoryType = t;
+				break;
+			}
+		}
+		if (memoryType == UINT32_MAX)
+			return false;
+		VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+		allocateInfo.allocationSize = requirements.size;
+		allocateInfo.memoryTypeIndex = memoryType;
+		if (vkAllocateMemory(g.vkDevice, &allocateInfo, nullptr, &memory) != VK_SUCCESS)
+			return false;
+		vkBindImageMemory(g.vkDevice, image, memory, 0);
+
+		VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		vkResetCommandBuffer(g.commandBuffer, 0);
+		vkBeginCommandBuffer(g.commandBuffer, &beginInfo);
+
+		VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+		barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image = image;
+		barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		vkCmdPipelineBarrier(g.commandBuffer, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+		VkClearColorValue color{};
+		color.float32[0] = red;
+		color.float32[1] = green;
+		color.float32[2] = blue;
+		color.float32[3] = 1.0f;
+		VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vkCmdClearColorImage(g.commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+
+		barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		vkCmdPipelineBarrier(g.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+		vkEndCommandBuffer(g.commandBuffer);
+		VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+		submit.commandBufferCount = 1;
+		submit.pCommandBuffers = &g.commandBuffer;
+		vkQueueSubmit(g.queue, 1, &submit, VK_NULL_HANDLE);
+		vkDeviceWaitIdle(g.vkDevice);
+		return true;
+	}
+
 	bool CreateFrameResources()
 	{
 		VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -462,6 +609,15 @@ namespace
 		{
 			LOGE("vkCreateFence failed");
 			return false;
+		}
+
+		if (!CreateSolidCursorImage(g.cursorImageBlack, g.cursorMemoryBlack, 0.0f, 0.0f, 0.0f) ||
+			!CreateSolidCursorImage(g.cursorImageWhite, g.cursorMemoryWhite, 1.0f, 1.0f, 1.0f))
+		{
+			// The cursor is cosmetic; keep rendering even if it cannot be created.
+			LOGE("failed to create cursor images");
+			g.cursorImageBlack = VK_NULL_HANDLE;
+			g.cursorImageWhite = VK_NULL_HANDLE;
 		}
 		return true;
 	}
@@ -638,7 +794,98 @@ namespace VrRuntime
 		return g.colorImages;
 	}
 
-	void UpdateInput()
+	// Maps the right controller ray onto the virtual screen and turns the right
+	// trigger into a stylus. Games that are played on the GamePad touchscreen
+	// (e.g. Kirby and the Rainbow Curse) are otherwise completely unresponsive.
+	void UpdateScreenTouch(XrTime displayTime)
+	{
+		if (g.aimSpaceRight == XR_NULL_HANDLE)
+			return;
+
+		XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+		const XrResult result = xrLocateSpace(g.aimSpaceRight, g.localSpace, displayTime, &location);
+		const bool poseValid = XR_SUCCEEDED(result) &&
+			(location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+			(location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+
+		bool hit = false;
+		float u = 0.0f, v = 0.0f;
+		if (poseValid)
+		{
+			const XrVector3f& p = location.pose.position;
+			const XrQuaternionf& q = location.pose.orientation;
+			// forward direction = q * (0,0,-1)
+			const float fx = -2.0f * (q.x * q.z + q.w * q.y);
+			const float fy = 2.0f * (q.w * q.x - q.y * q.z);
+			const float fz = -1.0f + 2.0f * (q.x * q.x + q.y * q.y);
+			if (fz < -1.0e-4f)
+			{
+				const float t = (kQuadZ - p.z) / fz;
+				if (t > 0.0f)
+				{
+					const float hx = p.x + fx * t;
+					const float hy = p.y + fy * t;
+					if (std::fabs(hx) <= kQuadWidth * 0.5f && std::fabs(hy) <= kQuadHeight * 0.5f)
+					{
+						hit = true;
+						u = (hx + kQuadWidth * 0.5f) / kQuadWidth;
+						v = (kQuadHeight * 0.5f - hy) / kQuadHeight;
+					}
+				}
+			}
+		}
+
+		g.pointerOnScreen = hit;
+		if (hit)
+		{
+			g.pointerU = u;
+			g.pointerV = v;
+		}
+
+		const bool press = hit && g.screenIsGamePad && GetFloat(g.triggerRight) > 0.5f;
+		if (press)
+		{
+			g.touchX = std::clamp((sint32)std::lround(u * (float)g.extent.width), 0, (sint32)g.extent.width - 1);
+			g.touchY = std::clamp((sint32)std::lround(v * (float)g.extent.height), 0, (sint32)g.extent.height - 1);
+			NativeInput::OnTouchEvent(g.touchX, g.touchY, false, true);
+			if (!g.touchActive)
+				LOGI("stylus down at %d,%d", g.touchX, g.touchY);
+			g.touchActive = true;
+		}
+		else if (g.touchActive)
+		{
+			NativeInput::OnTouchEvent(g.touchX, g.touchY, false, false);
+			LOGI("stylus up at %d,%d", g.touchX, g.touchY);
+			g.touchActive = false;
+		}
+	}
+
+	void UpdateScreenView()
+	{
+		// Holding both grips for ~0.7 s toggles between the TV and GamePad screen.
+		const bool bothGrips = GetFloat(g.squeezeLeft) > 0.5f && GetFloat(g.squeezeRight) > 0.5f;
+		const auto now = std::chrono::steady_clock::now();
+		if (!bothGrips)
+		{
+			g.viewChordLatched = false;
+			g.viewChordFired = false;
+			return;
+		}
+		if (!g.viewChordLatched)
+		{
+			g.viewChordLatched = true;
+			g.viewChordStart = now;
+			return;
+		}
+		if (!g.viewChordFired && now - g.viewChordStart > std::chrono::milliseconds(700))
+		{
+			g.viewChordFired = true;
+			g.screenIsGamePad = !g.screenIsGamePad;
+			ApplyScreenView();
+		}
+	}
+
+	void UpdateInput(XrTime displayTime)
 	{
 		if (!g.sessionRunning || g.actionSet == XR_NULL_HANDLE)
 			return;
@@ -781,6 +1028,9 @@ namespace VrRuntime
 		           ButtonId::kButtonId_StickL_Up, ButtonId::kButtonId_StickL_Down);
 		applyStick(GetVector2(g.thumbstickRight), ButtonId::kButtonId_StickR_Left, ButtonId::kButtonId_StickR_Right,
 		           ButtonId::kButtonId_StickR_Up, ButtonId::kButtonId_StickR_Down);
+
+		UpdateScreenTouch(displayTime);
+		UpdateScreenView();
 	}
 
 	bool ConsumeExitRequest()
@@ -788,6 +1038,39 @@ namespace VrRuntime
 		const bool requested = g.userExitRequested;
 		g.userExitRequested = false;
 		return requested;
+	}
+
+	void Shutdown()
+	{
+		static std::mutex shutdownMutex;
+		std::scoped_lock lock(shutdownMutex);
+		g.exitRequested = true;
+		if (g.session == XR_NULL_HANDLE)
+			return;
+		// Let a frame that is already in flight finish before tearing the
+		// session down; PresentFrame checks exitRequested at its entry.
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		if (g.sessionRunning)
+		{
+			xrEndSession(g.session);
+			g.sessionRunning = false;
+		}
+		for (XrSpace* space : {&g.aimSpaceLeft, &g.aimSpaceRight, &g.localSpace})
+		{
+			if (*space != XR_NULL_HANDLE)
+			{
+				xrDestroySpace(*space);
+				*space = XR_NULL_HANDLE;
+			}
+		}
+		xrDestroySession(g.session);
+		g.session = XR_NULL_HANDLE;
+		g.sessionCreated = false;
+		g.swapchain = XR_NULL_HANDLE;
+		g.exitRequested = false;
+		g.userExitRequested = false;
+		g.touchActive = false;
+		LOGI("OpenXR session destroyed");
 	}
 
 	bool PresentFrame(VkImage sourceImage, VkSemaphore waitSemaphore)
@@ -812,7 +1095,7 @@ namespace VrRuntime
 		if (XR_FAILED(xrBeginFrame(g.session, &beginInfo)))
 			return false;
 
-		UpdateInput();
+		UpdateInput(frameState.predictedDisplayTime);
 
 		auto endEmptyFrame = [&frameState]()
 		{
@@ -882,6 +1165,39 @@ namespace VrRuntime
 			g.swapchainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			1, &region, VK_FILTER_LINEAR);
 
+		// Cursor: a small black disc with a white centre at the point where the
+		// right controller ray meets the screen, so the player can see where the
+		// stylus will land. Drawn straight into the presented image (no extra
+		// composition layer required).
+		if (g.pointerOnScreen && g.cursorImageBlack != VK_NULL_HANDLE)
+		{
+			const sint32 px = std::clamp((sint32)std::lround(g.pointerU * (float)g.swapchainWidth), 0, (sint32)g.swapchainWidth - 1);
+			const sint32 py = std::clamp((sint32)std::lround(g.pointerV * (float)g.swapchainHeight), 0, (sint32)g.swapchainHeight - 1);
+			const sint32 outerHalf = g.touchActive ? 13 : 10;
+			const sint32 innerHalf = g.touchActive ? 8 : 5;
+			auto blitDot = [&](VkImage source, sint32 half)
+			{
+				const sint32 x0 = std::clamp(px - half, 0, (sint32)g.swapchainWidth);
+				const sint32 x1 = std::clamp(px + half, 0, (sint32)g.swapchainWidth);
+				const sint32 y0 = std::clamp(py - half, 0, (sint32)g.swapchainHeight);
+				const sint32 y1 = std::clamp(py + half, 0, (sint32)g.swapchainHeight);
+				if (x1 <= x0 || y1 <= y0)
+					return;
+				VkImageBlit dot{};
+				dot.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+				dot.srcOffsets[0] = {0, 0, 0};
+				dot.srcOffsets[1] = {1, 1, 1};
+				dot.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+				dot.dstOffsets[0] = {x0, y0, 0};
+				dot.dstOffsets[1] = {x1, y1, 1};
+				vkCmdBlitImage(g.commandBuffer, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+					g.swapchainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+					1, &dot, VK_FILTER_NEAREST);
+			};
+			blitDot(g.cursorImageBlack, outerHalf);
+			blitDot(g.cursorImageWhite, innerHalf);
+		}
+
 		VkImageMemoryBarrier toSampled = barriers[1];
 		toSampled.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 		toSampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -920,8 +1236,8 @@ namespace VrRuntime
 		quad.subImage.imageRect = {{0, 0}, {(int32_t)g.swapchainWidth, (int32_t)g.swapchainHeight}};
 		quad.subImage.imageArrayIndex = 0;
 		quad.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-		quad.pose.position = {0.0f, 0.0f, -2.0f};
-		quad.size = {2.4f, 1.35f};
+		quad.pose.position = {0.0f, 0.0f, kQuadZ};
+		quad.size = {kQuadWidth, kQuadHeight};
 
 		const XrCompositionLayerBaseHeader* layers[1] = {
 			reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad)

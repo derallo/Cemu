@@ -51,6 +51,10 @@ object NativeEmulation {
     @JvmStatic
     external fun setReplaceTVWithPadView(swapped: Boolean)
 
+    /** Stops emulation and releases the title mounts so another launch can succeed. */
+    @JvmStatic
+    external fun shutdownTitle()
+
     @JvmStatic
     external fun supportsLoadingCustomDriver(): Boolean
 }

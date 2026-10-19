@@ -96,7 +96,7 @@ open class EmulationActivity : AppCompatActivity() {
     protected open fun isVrMode(): Boolean =
         intent?.getBooleanExtra(EXTRA_VR, false) == true
 
-    private fun getGamePath(): String {
+    private fun getGamePath(): String? {
         val extras = intent.extras
         val data = intent.data
         var launchPath: String? = null
@@ -107,10 +107,6 @@ open class EmulationActivity : AppCompatActivity() {
 
         if (launchPath == null && data != null) {
             launchPath = data.toString()
-        }
-
-        if (launchPath == null) {
-            throw RuntimeException("launchPath is null")
         }
 
         return launchPath
@@ -127,7 +123,14 @@ open class EmulationActivity : AppCompatActivity() {
 
         setFullscreen()
 
+        // Started from the launcher tile (no title attached): there is nothing
+        // to emulate. Finishing here still requires super.onCreate() to have
+        // run first, otherwise Android throws SuperNotCalledException.
         val gamePath = getGamePath()
+        if (gamePath == null) {
+            finish()
+            return
+        }
         val isVr = isVrMode()
         if (isVr) {
             check(NativeVr.initialize(this)) { "Failed to initialize OpenXR" }

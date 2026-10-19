@@ -5,6 +5,13 @@
 
 ControllerPtr CreateDefaultDeviceController();
 
+// Feeds a pointer position into the emulated GamePad/FrontPanel screen. isTV
+// selects the TV canvas, false selects the GamePad (DRC) touchscreen.
+namespace NativeInput
+{
+	void OnTouchEvent(sint32 x, sint32 y, bool isTV, bool status);
+}
+
 class EmulatedControllerManager
 {
   private:

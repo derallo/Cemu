@@ -40,4 +40,9 @@ namespace VrRuntime
 
 	// True once per "exit VR" gesture (both thumbstick clicks) until consumed.
 	bool ConsumeExitRequest();
+
+	// Ends and destroys the OpenXR session. Must run before Cemu destroys the
+	// Vulkan device the session is bound to (i.e. before stopping the title),
+	// otherwise the next launch would create a second session on a dead device.
+	void Shutdown();
 }
