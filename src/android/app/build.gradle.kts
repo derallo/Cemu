@@ -90,6 +90,9 @@ android {
         }
         release {
             isMinifyEnabled = true
+            // Opt-in only: allows `run-as` for on-device profiling builds.
+            if (providers.gradleProperty("cemuDebuggableRelease").isPresent)
+                isDebuggable = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

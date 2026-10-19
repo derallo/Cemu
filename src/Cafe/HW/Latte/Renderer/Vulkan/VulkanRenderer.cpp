@@ -21,6 +21,10 @@
 #include "config/CemuConfig.h"
 #include "WindowSystem.h"
 
+#if BOOST_PLAT_ANDROID
+#include "VrRuntime.h"
+#endif
+
 #include "imgui/imgui_extension.h"
 #include "imgui/imgui_impl_vulkan.h"
 
@@ -513,6 +517,10 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
 
 	// check available instance extensions
 	std::vector<const char*> enabledInstanceExtensions = CheckInstanceExtensionSupport(m_featureControl);
+#if BOOST_PLAT_ANDROID
+	if (VrRuntime::IsActive())
+		VrRuntime::AppendInstanceExtensions(enabledInstanceExtensions);
+#endif
 
 	uint32 apiVersion = VK_API_VERSION_1_1;
 	if (vkEnumerateInstanceVersion(&apiVersion) != VK_SUCCESS)
@@ -753,6 +761,11 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
 	vkGetDeviceQueue(m_logicalDevice, m_indices.graphicsFamily, 0, &m_graphicsQueue);
 	vkGetDeviceQueue(m_logicalDevice, m_indices.graphicsFamily, 0, &m_presentQueue);
 
+#if BOOST_PLAT_ANDROID
+	if (VrRuntime::IsActive())
+		VrRuntime::OnVulkanReady(m_instance, m_physicalDevice, m_logicalDevice, m_indices.graphicsFamily, m_graphicsQueue);
+#endif
+
 	vkDestroySurfaceKHR(m_instance, surface, nullptr);
 
 	if (useValidationLayer && m_featureControl.instanceExtensions.debug_utils)
@@ -964,6 +977,19 @@ VulkanRenderer* VulkanRenderer::GetInstance()
 
 void VulkanRenderer::InitializeSurface(const Vector2i& size, bool mainWindow)
 {
+#if BOOST_PLAT_ANDROID
+	if (mainWindow && VrRuntime::IsSessionReady())
+	{
+		const auto extent = VrRuntime::GetColorExtent();
+		auto& windowInfo = WindowSystem::GetWindowInfo();
+		windowInfo.width = windowInfo.phys_width = (sint32)extent.width;
+		windowInfo.height = windowInfo.phys_height = (sint32)extent.height;
+		m_mainSwapchainInfo = std::make_unique<SwapchainInfoVk>(mainWindow, size, true);
+		m_mainSwapchainInfo->CreateWithExternalImages(VrRuntime::GetColorImages(), VrRuntime::GetColorFormat(), extent);
+		return;
+	}
+#endif
+
 	if (mainWindow)
 	{
 		m_mainSwapchainInfo = std::make_unique<SwapchainInfoVk>(mainWindow, size);
@@ -1327,6 +1353,11 @@ VkDeviceCreateInfo VulkanRenderer::CreateDeviceCreateInfo(const std::vector<VkDe
 		used_extensions.emplace_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 		used_extensions.emplace_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 	}
+
+#if BOOST_PLAT_ANDROID
+	if (VrRuntime::IsActive())
+		VrRuntime::AppendDeviceExtensions(used_extensions);
+#endif
 
 	VkDeviceCreateInfo createInfo{};
 	createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -3051,6 +3082,18 @@ void VulkanRenderer::RecreateSwapchain(bool mainWindow, bool skipCreate)
 bool VulkanRenderer::UpdateSwapchainProperties(bool mainWindow)
 {
 	auto& chainInfo = GetChainInfo(mainWindow);
+
+#if BOOST_PLAT_ANDROID
+	// VR presentation has no VkSurface: the images are owned by the OpenXR
+	// runtime for the whole session, so never recreate the swapchain.
+	if (chainInfo.m_externalImages)
+	{
+		chainInfo.m_shouldRecreate = false;
+		chainInfo.m_vsyncState = (VSync)GetConfig().vsync.GetValue();
+		return true;
+	}
+#endif
+
 	bool stateChanged = chainInfo.m_shouldRecreate;
 
 	const auto configValue =  (VSync)GetConfig().vsync.GetValue();
@@ -3115,6 +3158,16 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
 	m_commandBufferIDOfPrevFrame = currentFrameCmdBufferID;
 
 	chainInfo.WaitAvailableFence();
+
+#if BOOST_PLAT_ANDROID
+	if (chainInfo.m_externalImages)
+	{
+		VrRuntime::PresentFrame(chainInfo.m_swapchainImages[chainInfo.swapchainImageIndex], presentSemaphore);
+		chainInfo.hasDefinedSwapchainImage = false;
+		chainInfo.swapchainImageIndex = -1;
+		return;
+	}
+#endif
 
 	VkPresentIdKHR presentId = {};
 

@@ -25,6 +25,7 @@ import info.cemu.cemu.emulation.input.DeviceMotionHandler
 import info.cemu.cemu.emulation.input.HotkeyManager
 import info.cemu.cemu.emulation.input.InputHandler
 import info.cemu.cemu.emulation.input.NativeInputDeviceListener
+import info.cemu.cemu.nativeinterface.NativeVr
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -66,7 +67,7 @@ private class InputDelegateManager(context: Context) {
     }
 }
 
-class EmulationActivity : AppCompatActivity() {
+open class EmulationActivity : AppCompatActivity() {
     private lateinit var inputManager: InputDelegateManager
     private var processInputEvents = true
 
@@ -91,6 +92,9 @@ class EmulationActivity : AppCompatActivity() {
 
         return super.dispatchKeyEvent(event)
     }
+
+    protected open fun isVrMode(): Boolean =
+        intent?.getBooleanExtra(EXTRA_VR, false) == true
 
     private fun getGamePath(): String {
         val extras = intent.extras
@@ -124,12 +128,17 @@ class EmulationActivity : AppCompatActivity() {
         setFullscreen()
 
         val gamePath = getGamePath()
+        val isVr = isVrMode()
+        if (isVr) {
+            check(NativeVr.initialize(this)) { "Failed to initialize OpenXR" }
+        }
 
         setContent {
             TranslatableContent {
                 ActivityContent {
                     EmulationScreen(
                         gamePath = gamePath,
+                        isVr = isVr,
                         setMotionSensorEnabled = inputManager::setDeviceMotionEnabled,
                         onQuit = ::onQuit,
                         setInputListeningEnabled = { processInputEvents = it },
@@ -176,5 +185,6 @@ class EmulationActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_LAUNCH_PATH: String = BuildConfig.APPLICATION_ID + ".LaunchPath"
+        const val EXTRA_VR: String = BuildConfig.APPLICATION_ID + ".Vr"
     }
 }

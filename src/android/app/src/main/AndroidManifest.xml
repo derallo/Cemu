@@ -62,6 +62,21 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".emulation.EmulationVrActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:label="Cemu VR"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.Cemu">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="com.oculus.intent.category.VR" />
+            </intent-filter>
+        </activity>
+
         <provider
             android:name=".provider.DocumentsProvider"
             android:authorities="${applicationId}.provider"

@@ -23,6 +23,15 @@ SwapchainInfoVk::SwapchainInfoVk(bool mainWindow, Vector2i size) : mainWindow(ma
 }
 
 
+SwapchainInfoVk::SwapchainInfoVk(bool mainWindow, Vector2i size, bool externalImages) : mainWindow(mainWindow), m_desiredExtent(size)
+{
+	m_externalImages = externalImages;
+	auto renderer = VulkanRenderer::GetInstance();
+	m_instance = renderer->GetVkInstance();
+	m_logicalDevice = renderer->GetLogicalDevice();
+	m_physicalDevice = renderer->GetPhysicalDevice();
+}
+
 SwapchainInfoVk::~SwapchainInfoVk()
 {
 	Cleanup();
@@ -83,6 +92,19 @@ void SwapchainInfoVk::Create()
 	result = vkGetSwapchainImagesKHR(m_logicalDevice, m_swapchain, &image_count, m_swapchainImages.data());
 	if (result != VK_SUCCESS)
 		UnrecoverableError("Error attempting to retrieve swapchain images");
+	CreateImageResources();
+
+	m_acquireIndex = 0;
+	hasDefinedSwapchainImage = false;
+
+	m_queueDepth = 0;
+}
+
+
+void SwapchainInfoVk::CreateImageResources()
+{
+	VkResult result;
+
 	// create default renderpass
 	VkAttachmentDescription colorAttachment = {};
 	colorAttachment.format = m_surfaceFormat.format;
@@ -180,9 +202,20 @@ void SwapchainInfoVk::Create()
 	if (result != VK_SUCCESS)
 		UnrecoverableError("Failed to create fence for swapchain");
 
+}
+
+void SwapchainInfoVk::CreateWithExternalImages(std::vector<VkImage> images, VkFormat format, VkExtent2D extent)
+{
+	m_externalImages = true;
+	m_swapchain = VK_NULL_HANDLE;
+	m_swapchainImages = std::move(images);
+	m_surfaceFormat = {};
+	m_surfaceFormat.format = format;
+	m_surfaceFormat.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+	m_actualExtent = extent;
+	CreateImageResources();
 	m_acquireIndex = 0;
 	hasDefinedSwapchainImage = false;
-
 	m_queueDepth = 0;
 }
 
@@ -228,6 +261,8 @@ void SwapchainInfoVk::Cleanup()
 
 bool SwapchainInfoVk::IsValid() const
 {
+	if (m_externalImages)
+		return !m_swapchainImages.empty();
 	return m_swapchain && !m_acquireSemaphores.empty();
 }
 
@@ -252,6 +287,15 @@ VkSemaphore SwapchainInfoVk::ConsumeAcquireSemaphore()
 
 bool SwapchainInfoVk::AcquireImage()
 {
+	if (m_externalImages)
+	{
+		// No presentation engine: cycle through the images owned by the VR runtime.
+		swapchainImageIndex = (swapchainImageIndex + 1) % (uint32)m_swapchainImages.size();
+		m_awaitableFence = VK_NULL_HANDLE;
+		m_currentSemaphore = VK_NULL_HANDLE;
+		return true;
+	}
+
 	ResetAvailableFence();
 
 	VkSemaphore acquireSemaphore = m_acquireSemaphores[m_acquireIndex];

@@ -334,6 +334,8 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulation_prepareTitle([[maybe_unused]
 {
 	fs::path launchPath = JNIUtils::FromJString(env, launchPathJava);
 
+	try
+	{
 	TitleInfo launchTitle{launchPath};
 
 	using enum NativeEmulation::PrepareTitleResult;
@@ -382,6 +384,15 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulation_prepareTitle([[maybe_unused]
 	}
 
 	return SUCCESSFUL;
+	}
+	catch (const std::exception& exception)
+	{
+		// Unreadable/invalid paths raise filesystem_error; surface it as a Java
+		// NativeException instead of terminating the process.
+		jclass exceptionClass = env->FindClass("info/cemu/cemu/nativeinterface/NativeException");
+		env->ThrowNew(exceptionClass, exception.what());
+		return NativeEmulation::PrepareTitleResult::ERROR_UNKNOWN;
+	}
 }
 
 extern "C" [[maybe_unused]] JNIEXPORT void JNICALL

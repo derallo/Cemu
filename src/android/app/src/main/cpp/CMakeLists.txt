@@ -17,7 +17,9 @@ add_library(CemuAndroid SHARED
         NativeLogging.cpp
         NativeSettings.cpp
         NativeSwkbd.cpp
+        NativeVr.cpp
         VrProbe.cpp
+        VrRuntime.cpp
         WuaConverter.cpp
 )
 

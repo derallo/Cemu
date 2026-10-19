@@ -51,6 +51,7 @@ private inline fun <reified T : Any> NavGraphBuilder.composableGameScreen(
 fun NavGraphBuilder.gamesNavigation(
     navController: NavHostController,
     startGame: (NativeGameTitles.Game) -> Unit,
+    startGameInVr: (NativeGameTitles.Game) -> Unit,
     tryCreateShortcut: (NativeGameTitles.Game) -> Boolean,
     goToSettings: () -> Unit,
     goToTitleManager: () -> Unit,
@@ -62,6 +63,7 @@ fun NavGraphBuilder.gamesNavigation(
             val gameViewModel: GameViewModel = viewModel(backStackEntry)
             GamesListScreen(
                 startGame = startGame,
+                startGameInVr = startGameInVr,
                 tryCreateShortcut = tryCreateShortcut,
                 goToGameEditProfile = { game ->
                     gameViewModel.game = game

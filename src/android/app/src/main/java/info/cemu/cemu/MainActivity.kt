@@ -24,6 +24,7 @@ import info.cemu.cemu.common.input.GamepadInputSource
 import info.cemu.cemu.common.ui.components.ActivityContent
 import info.cemu.cemu.common.ui.localization.TranslatableContent
 import info.cemu.cemu.emulation.EmulationActivity
+import info.cemu.cemu.emulation.EmulationVrActivity
 import info.cemu.cemu.games.GameListRoute
 import info.cemu.cemu.games.gamesNavigation
 import info.cemu.cemu.graphicpacks.GraphicPacksRoute
@@ -94,6 +95,7 @@ private fun MainNav() {
         gamesNavigation(
             navController = navController,
             startGame = { startGame(context, it) },
+            startGameInVr = { startGameInVr(context, it) },
             tryCreateShortcut = { tryCreateShortcutForGame(context, it) },
             goToSettings = { navController.navigate(SettingsRoute) },
             goToTitleManager = { navController.navigate(TitleManagerRoute) },
@@ -115,6 +117,15 @@ private fun createIntentForGame(context: Context, game: Game): Intent {
     intent.putExtra(EmulationActivity.EXTRA_LAUNCH_PATH, game.path)
 
     return intent
+}
+
+private fun startGameInVr(context: Context, game: Game) {
+    NativeSettings.saveSettings()
+
+    val intent = Intent(context, EmulationVrActivity::class.java)
+    intent.action = Intent.ACTION_VIEW
+    intent.putExtra(EmulationActivity.EXTRA_LAUNCH_PATH, game.path)
+    context.startActivity(intent)
 }
 
 private fun startGame(context: Context, game: Game) {

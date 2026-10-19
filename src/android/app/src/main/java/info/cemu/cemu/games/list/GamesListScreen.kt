@@ -79,6 +79,7 @@ fun GamesListScreen(
     goToGameDetails: (Game) -> Unit,
     goToGameEditProfile: (Game) -> Unit,
     startGame: (Game) -> Unit,
+    startGameInVr: (Game) -> Unit,
     goToSettings: () -> Unit,
     goToTitleManager: () -> Unit,
     goToGraphicPacks: () -> Unit,
@@ -174,6 +175,7 @@ fun GamesListScreen(
                     snackbarHostState.showMessage(coroutineScope, tr("Shader caches removed"))
                 },
                 startGame = startGame,
+                startGameInVr = startGameInVr,
                 goToGameDetails = goToGameDetails,
                 goToGameEditProfile = goToGameEditProfile,
                 createShortcut = {
@@ -201,6 +203,7 @@ fun GamesListScreen(
 private fun GameList(
     games: List<Game>,
     startGame: (Game) -> Unit,
+    startGameInVr: (Game) -> Unit,
     goToGameDetails: (Game) -> Unit,
     goToGameEditProfile: (Game) -> Unit,
     setFavorite: (Game, Boolean) -> Unit,
@@ -219,6 +222,7 @@ private fun GameList(
                 modifier = Modifier.animateItem(),
                 game = game,
                 onStartGame = startGame,
+                onStartGameInVr = startGameInVr,
                 onIsFavoriteChanged = { isFavorite ->
                     setFavorite(game, isFavorite)
                 },
@@ -266,6 +270,7 @@ private fun ShaderCachesConfirmationDialog(
 @Composable
 private fun GameListItem(
     onStartGame: (Game) -> Unit,
+    onStartGameInVr: (Game) -> Unit,
     onIsFavoriteChanged: (Boolean) -> Unit,
     onEditGameProfile: () -> Unit,
     onRemoveShaderCaches: () -> Unit,
@@ -322,6 +327,7 @@ private fun GameListItem(
             onRemoveShaderCaches = onRemoveShaderCaches,
             onAboutTitle = onAboutTitle,
             onCreateShortcut = onCreateShortcut,
+            onStartGameInVr = { onStartGameInVr(game) },
         )
     }
 }
@@ -335,6 +341,7 @@ private fun GameContextMenu(
     onRemoveShaderCaches: () -> Unit,
     onAboutTitle: () -> Unit,
     onCreateShortcut: () -> Unit,
+    onStartGameInVr: () -> Unit,
     game: Game,
 ) {
     @Composable
@@ -373,6 +380,10 @@ private fun GameContextMenu(
             enabled = gameTitleHasCaches,
             onClick = onRemoveShaderCaches,
             text = tr("Remove shader caches")
+        )
+        GameContextMenuItem(
+            onClick = onStartGameInVr,
+            text = tr("Play in VR"),
         )
         GameContextMenuItem(
             onClick = onAboutTitle,

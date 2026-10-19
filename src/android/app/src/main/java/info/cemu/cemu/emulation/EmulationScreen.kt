@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -73,6 +74,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun EmulationScreen(
     gamePath: String,
+    isVr: Boolean = false,
     setMotionSensorEnabled: (Boolean) -> Unit,
     setInputListeningEnabled: (Boolean) -> Unit,
     onQuit: () -> Unit,
@@ -178,6 +180,7 @@ fun EmulationScreen(
         },
     ) {
         EmulationSurfaces(
+            isVr = isVr,
             sideMenuState = sideMenuState,
             gamePadPosition = gamePadPosition,
             mainHolderCallback = viewModel.mainHolderCallback,
@@ -390,12 +393,25 @@ private fun TextButtonItem(
 
 @Composable
 private fun EmulationSurfaces(
+    isVr: Boolean,
     sideMenuState: SideMenuState,
     gamePadPosition: GamePadPosition?,
     mainHolderCallback: SurfaceHolder.Callback,
     padHolderCallback: SurfaceHolder.Callback,
     onInitializeEmulation: () -> Unit
 ) {
+    if (isVr) {
+        // In VR mode Cemu renders into the OpenXR swapchain; there is no
+        // Android SurfaceView to attach.
+        LaunchedEffect(Unit) { onInitializeEmulation() }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(androidx.compose.ui.graphics.Color.Black)
+        )
+        return
+    }
+
     if (gamePadPosition == null) {
         return
     }

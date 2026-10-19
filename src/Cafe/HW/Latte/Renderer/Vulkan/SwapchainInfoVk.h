@@ -27,6 +27,8 @@ struct SwapchainInfoVk
 
 	void Cleanup();
 	void Create();
+	// VR path: no VkSurface/VkSwapchain, images are owned by the caller.
+	void CreateWithExternalImages(std::vector<VkImage> images, VkFormat format, VkExtent2D extent);
 
 	bool IsValid() const;
 
@@ -56,6 +58,8 @@ struct SwapchainInfoVk
 	}
 
 	SwapchainInfoVk(bool mainWindow, Vector2i size);
+	// Used in VR mode: no ANativeWindow/VkSurface is created.
+	SwapchainInfoVk(bool mainWindow, Vector2i size, bool externalImages);
 	SwapchainInfoVk(const SwapchainInfoVk&) = delete;
 	SwapchainInfoVk(SwapchainInfoVk&&) noexcept = default;
 	~SwapchainInfoVk();
@@ -67,6 +71,7 @@ struct SwapchainInfoVk
 #endif
 
 	bool m_shouldRecreate = false;
+	bool m_externalImages = false;
 	VSync m_vsyncState = VSync::Immediate;
 	bool hasDefinedSwapchainImage{}; // indicates if the swapchain image is in a defined state
 	VkInstance m_instance{};
@@ -92,6 +97,7 @@ struct SwapchainInfoVk
 	VkRenderPass m_swapchainRenderPass = nullptr;
 
 private:
+	void CreateImageResources();
 	uint32 m_acquireIndex = 0;
 	std::vector<VkSemaphore> m_acquireSemaphores; // indexed by m_acquireIndex
 	VkFence m_imageAvailableFence{};
