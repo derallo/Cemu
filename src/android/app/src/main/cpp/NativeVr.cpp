@@ -13,3 +13,9 @@ Java_info_cemu_cemu_nativeinterface_NativeVr_isActive([[maybe_unused]] JNIEnv* e
 {
 	return VrRuntime::IsActive() ? JNI_TRUE : JNI_FALSE;
 }
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeVr_consumeExitRequest([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
+{
+	return VrRuntime::ConsumeExitRequest() ? JNI_TRUE : JNI_FALSE;
+}

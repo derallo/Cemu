@@ -37,4 +37,7 @@ namespace VrRuntime
 
 	// Feed Touch controller state into Cemu's emulated controller.
 	void UpdateInput();
+
+	// True once per "exit VR" gesture (both thumbstick clicks) until consumed.
+	bool ConsumeExitRequest();
 }

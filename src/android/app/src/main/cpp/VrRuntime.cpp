@@ -17,7 +17,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <atomic>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,8 +30,41 @@
 #include "VrRuntimeAndroid.h"
 
 #define LOG_TAG "CemuVR"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+namespace
+{
+	// Logcat buffers roll over, and VR sessions are often tested hours after
+	// they start. Mirror every message into the app's external files dir.
+	std::string g_logFilePath;
+	FILE* g_logFile = nullptr;
+	std::mutex g_logMutex;
+
+	void LogVr(int priority, const char* format, ...)
+	{
+		char buffer[2048];
+		va_list args;
+		va_start(args, format);
+		vsnprintf(buffer, sizeof(buffer), format, args);
+		va_end(args);
+
+		__android_log_print(priority, LOG_TAG, "%s", buffer);
+
+		std::lock_guard<std::mutex> lock(g_logMutex);
+		if (!g_logFilePath.empty())
+		{
+			if (!g_logFile)
+				g_logFile = fopen(g_logFilePath.c_str(), "a");
+			if (g_logFile)
+			{
+				fprintf(g_logFile, "%s\n", buffer);
+				fflush(g_logFile);
+			}
+		}
+	}
+}
+
+#define LOGI(...) LogVr(ANDROID_LOG_INFO, __VA_ARGS__)
+#define LOGE(...) LogVr(ANDROID_LOG_ERROR, __VA_ARGS__)
 
 // OpenXR virtual screen backend.
 //
@@ -39,9 +77,10 @@ namespace
 	struct VrState
 	{
 		bool initialized = false;
-		bool sessionCreated = false;
-		bool sessionRunning = false;
-		bool exitRequested = false;
+		std::atomic_bool sessionCreated{false};
+		std::atomic_bool sessionRunning{false};
+		std::atomic_bool exitRequested{false};
+		std::atomic_bool inputThreadRun{false};
 
 		JavaVM* vm = nullptr;
 		jobject context = nullptr;
@@ -97,6 +136,9 @@ namespace
 		XrAction stickClickRight = XR_NULL_HANDLE;
 
 		bool controllerInitialized = false;
+		bool exitChordLatched = false;
+		bool userExitRequested = false;
+		std::atomic_int lastSyncResult{0};
 	};
 
 	VrState g;
@@ -467,6 +509,7 @@ namespace
 			case XR_SESSION_STATE_LOSS_PENDING:
 				g.sessionRunning = false;
 				g.exitRequested = true;
+				g.inputThreadRun = false;
 				break;
 			default:
 				break;
@@ -573,6 +616,10 @@ namespace VrRuntime
 		if (!CreateFrameResources())
 			return;
 
+		// Poll OpenXR input independently of rendering: a stalled emulator must
+		// not freeze controller state (and input keeps working while frames hitch).
+		g.inputThreadRun = false; // input is polled inside the frame loop
+
 		LOGI("VR runtime ready (%ux%u)", g.extent.width, g.extent.height);
 	}
 
@@ -600,8 +647,33 @@ namespace VrRuntime
 		XrActionsSyncInfo syncInfo{XR_TYPE_ACTIONS_SYNC_INFO};
 		syncInfo.countActiveActionSets = 1;
 		syncInfo.activeActionSets = &activeSet;
-		if (XR_FAILED(xrSyncActions(g.session, &syncInfo)))
+		XrResult syncResult = xrSyncActions(g.session, &syncInfo);
+		if (XR_FAILED(syncResult))
+		{
+			static int syncFailures = 0;
+			if (syncFailures++ < 5)
+				LOGE("xrSyncActions failed: %d", syncResult);
 			return;
+		}
+		g.lastSyncResult = (int)syncResult;
+
+		static bool loggedProfile = false;
+		if (!loggedProfile)
+		{
+			loggedProfile = true;
+			for (const char* hand : {"/user/hand/left", "/user/hand/right"})
+			{
+				XrPath handPath = XR_NULL_PATH;
+				xrStringToPath(g.instance, hand, &handPath);
+				XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE};
+				XrResult r = xrGetCurrentInteractionProfile(g.session, handPath, &state);
+				char pathBuffer[256] = "<none>";
+				uint32_t length = 0;
+				if (XR_SUCCEEDED(r) && state.interactionProfile != XR_NULL_PATH)
+					xrPathToString(g.instance, state.interactionProfile, sizeof(pathBuffer), &length, pathBuffer);
+				LOGI("interaction profile %s -> %s (result %d)", hand, pathBuffer, r);
+			}
+		}
 
 		auto& controller = EmulatedControllerManager::GetController(0);
 		if (!g.controllerInitialized)
@@ -623,6 +695,81 @@ namespace VrRuntime
 		controller.SetButtonValue(ButtonId::kButtonId_StickL, GetBool(g.stickClickLeft));
 		controller.SetButtonValue(ButtonId::kButtonId_StickR, GetBool(g.stickClickRight));
 
+		static int inputLogCount = 0;
+		static auto lastInputLog = std::chrono::steady_clock::now();
+		const auto inputNow = std::chrono::steady_clock::now();
+		if (inputLogCount < 240 && inputNow - lastInputLog > std::chrono::seconds(5))
+		{
+			lastInputLog = inputNow;
+			inputLogCount++;
+			const XrVector2f ls = GetVector2(g.thumbstickLeft), rs = GetVector2(g.thumbstickRight);
+			char leftProfile[256] = "<none>", rightProfile[256] = "<none>";
+			uint32_t length = 0;
+			for (int hand = 0; hand < 2; hand++)
+			{
+				XrPath handPath = XR_NULL_PATH;
+				xrStringToPath(g.instance, hand == 0 ? "/user/hand/left" : "/user/hand/right", &handPath);
+				XrInteractionProfileState profile{XR_TYPE_INTERACTION_PROFILE_STATE};
+				if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(g.session, handPath, &profile)) &&
+					profile.interactionProfile != XR_NULL_PATH)
+					xrPathToString(g.instance, profile.interactionProfile, sizeof(leftProfile), &length,
+						hand == 0 ? leftProfile : rightProfile);
+			}
+			LOGI("input state (sync=%d): A=%d B=%d X=%d Y=%d menu=%d TL=%.2f TR=%.2f SL=%.2f SR=%.2f L=(%.2f,%.2f) R=(%.2f,%.2f) profiles=%s|%s",
+				g.lastSyncResult.load(), GetBool(g.buttonA), GetBool(g.buttonB), GetBool(g.buttonX), GetBool(g.buttonY),
+				GetBool(g.menuButton), GetFloat(g.triggerLeft), GetFloat(g.triggerRight),
+				GetFloat(g.squeezeLeft), GetFloat(g.squeezeRight), ls.x, ls.y, rs.x, rs.y,
+				leftProfile, rightProfile);
+		}
+
+		// Edge log: one line per button press regardless of the 5 s sampling rate.
+		{
+			static bool prevA = false, prevB = false, prevX = false, prevY = false, prevMenu = false;
+			static bool prevTL = false, prevTR = false, prevSL = false, prevSR = false;
+			const bool curA = GetBool(g.buttonA), curB = GetBool(g.buttonB);
+			const bool curX = GetBool(g.buttonX), curY = GetBool(g.buttonY);
+			const bool curMenu = GetBool(g.menuButton);
+			const bool curTL = GetFloat(g.triggerLeft) > 0.5f, curTR = GetFloat(g.triggerRight) > 0.5f;
+			const bool curSL = GetFloat(g.squeezeLeft) > 0.5f, curSR = GetFloat(g.squeezeRight) > 0.5f;
+			auto edge = [](bool now, bool& prev, const char* name) {
+				if (now && !prev)
+					LOGI("input event: %s", name);
+				prev = now;
+			};
+			edge(curA, prevA, "A"); edge(curB, prevB, "B"); edge(curX, prevX, "X"); edge(curY, prevY, "Y");
+			edge(curMenu, prevMenu, "menu"); edge(curTL, prevTL, "trigger L"); edge(curTR, prevTR, "trigger R");
+			edge(curSL, prevSL, "squeeze L"); edge(curSR, prevSR, "squeeze R");
+		}
+
+		// Exit gesture: press both thumbsticks.
+		const bool stickL = GetBool(g.stickClickLeft);
+		const bool stickR = GetBool(g.stickClickRight);
+		if (stickL && stickR && !g.exitChordLatched)
+		{
+			g.userExitRequested = true;
+			g.exitChordLatched = true;
+		}
+		else if (!stickL && !stickR)
+		{
+			g.exitChordLatched = false;
+		}
+
+		// One-time evidence that OpenXR actions reach the emulator.
+		static bool inputSeen = false;
+		if (!inputSeen)
+		{
+			const bool a = GetBool(g.buttonA), b = GetBool(g.buttonB), x = GetBool(g.buttonX), y = GetBool(g.buttonY);
+			const bool menu = GetBool(g.menuButton);
+			const XrVector2f ls = GetVector2(g.thumbstickLeft), rs = GetVector2(g.thumbstickRight);
+			if (a || b || x || y || menu || stickL || stickR ||
+				std::abs(ls.x) > 0.2f || std::abs(ls.y) > 0.2f || std::abs(rs.x) > 0.2f || std::abs(rs.y) > 0.2f)
+			{
+				LOGI("Touch input received: A=%d B=%d X=%d Y=%d menu=%d L=(%.2f,%.2f) R=(%.2f,%.2f)",
+					a, b, x, y, menu, ls.x, ls.y, rs.x, rs.y);
+				inputSeen = true;
+			}
+		}
+
 		auto applyStick = [&controller](XrVector2f stick, ButtonId left, ButtonId right, ButtonId up, ButtonId down)
 		{
 			controller.SetAxisValue(left, std::max(0.0f, -stick.x));
@@ -634,6 +781,13 @@ namespace VrRuntime
 		           ButtonId::kButtonId_StickL_Up, ButtonId::kButtonId_StickL_Down);
 		applyStick(GetVector2(g.thumbstickRight), ButtonId::kButtonId_StickR_Left, ButtonId::kButtonId_StickR_Right,
 		           ButtonId::kButtonId_StickR_Up, ButtonId::kButtonId_StickR_Down);
+	}
+
+	bool ConsumeExitRequest()
+	{
+		const bool requested = g.userExitRequested;
+		g.userExitRequested = false;
+		return requested;
 	}
 
 	bool PresentFrame(VkImage sourceImage, VkSemaphore waitSemaphore)
@@ -658,6 +812,8 @@ namespace VrRuntime
 		if (XR_FAILED(xrBeginFrame(g.session, &beginInfo)))
 			return false;
 
+		UpdateInput();
+
 		auto endEmptyFrame = [&frameState]()
 		{
 			XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
@@ -666,8 +822,6 @@ namespace VrRuntime
 			endInfo.layerCount = 0;
 			xrEndFrame(g.session, &endInfo);
 		};
-
-		UpdateInput();
 
 		XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
 		uint32_t imageIndex = 0;
@@ -781,9 +935,21 @@ namespace VrRuntime
 			return false;
 
 		static uint64_t frameCounter = 0;
+		static auto lastReport = std::chrono::steady_clock::now();
+		static uint64_t framesSinceReport = 0;
 		frameCounter++;
-		if (frameCounter == 1 || frameCounter % 120 == 0)
-			LOGI("VR frames submitted: %llu", (unsigned long long)frameCounter);
+		framesSinceReport++;
+		if (frameCounter == 1)
+			LOGI("first VR frame submitted");
+		const auto now = std::chrono::steady_clock::now();
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastReport).count();
+		if (elapsed >= 5000)
+		{
+			LOGI("VR fps: %.1f (%llu frames in %lld ms)", framesSinceReport * 1000.0 / (double)elapsed,
+				(unsigned long long)framesSinceReport, (long long)elapsed);
+			lastReport = now;
+			framesSinceReport = 0;
+		}
 
 		return true;
 	}
@@ -796,6 +962,30 @@ bool VrInitializeAndroid(JNIEnv* env, jobject context)
 
 	env->GetJavaVM(&g.vm);
 	g.context = context ? env->NewGlobalRef(context) : nullptr;
+
+	// <external files dir>/vr.log
+	if (context)
+	{
+		jclass contextClass = env->GetObjectClass(context);
+		jmethodID getFilesDir = env->GetMethodID(contextClass, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;");
+		jobject filesDir = getFilesDir ? env->CallObjectMethod(context, getFilesDir, nullptr) : nullptr;
+		if (filesDir)
+		{
+			jclass fileClass = env->GetObjectClass(filesDir);
+			jmethodID getPath = env->GetMethodID(fileClass, "getAbsolutePath", "()Ljava/lang/String;");
+			jstring path = getPath ? (jstring)env->CallObjectMethod(filesDir, getPath) : nullptr;
+			if (path)
+			{
+				const char* chars = env->GetStringUTFChars(path, nullptr);
+				g_logFilePath = std::string(chars) + "/vr.log";
+				env->ReleaseStringUTFChars(path, chars);
+				env->DeleteLocalRef(path);
+			}
+			env->DeleteLocalRef(fileClass);
+			env->DeleteLocalRef(filesDir);
+		}
+		env->DeleteLocalRef(contextClass);
+	}
 
 	if (!InitializeLoader())
 		return false;
