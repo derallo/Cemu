@@ -1,4 +1,5 @@
 #include "Cafe/OS/common/OSCommon.h"
+#include "Cafe/CafeSystem.h"
 #include "Cafe/HW/Espresso/PPCCallback.h"
 #include "Cafe/OS/RPL/rpl.h"
 #include "Cafe/OS/libs/coreinit/coreinit_Thread.h"
@@ -14,6 +15,9 @@
 #include "util/Fiber/Fiber.h"
 
 #include "util/helpers/helpers.h"
+
+#include <chrono>
+#include <thread>
 
 #ifdef __arm64__
 #if defined(__clang__)
@@ -1304,6 +1308,12 @@ namespace coreinit
 			}
 			if (isMainCore)
 			{
+				// With every guest thread suspended (title paused because the
+				// headset is off) there is nothing to schedule, and this loop
+				// would otherwise burn a full core. Sleep so an idle headset
+				// stays cool; resume latency is at most this delay.
+				if (CafeSystem::IsTitlePaused())
+					std::this_thread::sleep_for(std::chrono::milliseconds(2));
 				__OSCheckSystemEvents();
 				if(g_isMulticoreMode == false)
 					coreIndex = (coreIndex + 1) % 3;

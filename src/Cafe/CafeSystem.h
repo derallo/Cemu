@@ -30,6 +30,10 @@ namespace CafeSystem
 	PREPARE_STATUS_CODE PrepareForegroundTitleFromStandaloneRPX(const fs::path& path);
 	void LaunchForegroundTitle();
 	bool IsTitleRunning();
+	// True between PauseTitle() and ResumeTitle(). Idle loops (scheduler idle
+	// fiber, GPU command processor) use this to sleep instead of busy-waiting
+	// while the headset is off.
+	bool IsTitlePaused();
 
 	void PauseTitle();
 	void ResumeTitle();

@@ -20,6 +20,7 @@
 #include <cmath>
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -100,6 +101,17 @@ namespace
 		std::atomic_bool sessionRunning{false};
 		std::atomic_bool exitRequested{false};
 		std::atomic_bool inputThreadRun{false};
+
+		// Session state changes (headset off/on) must be observed even when no
+		// frames are being rendered: while the title is paused nothing submits
+		// work, so the render thread stops calling PresentFrame. A dedicated
+		// pump thread owns xrPollEvent, and PresentFrame waits here instead of
+		// spinning. Without this the IDLE -> READY transition is never seen and
+		// the app never resumes (only a relaunch recovers).
+		std::thread eventThread;
+		std::atomic_bool eventThreadRun{false};
+		std::mutex sessionStateMutex;
+		std::condition_variable sessionStateCv;
 
 		JavaVM* vm = nullptr;
 		jobject context = nullptr;
@@ -189,6 +201,9 @@ namespace
 	};
 
 	VrState g;
+
+	// Defined below; the session-creation path starts it.
+	void EventPumpMain();
 
 	const char* SessionStateName(XrSessionState state)
 	{
@@ -396,6 +411,8 @@ namespace
 		ApplyScreenView();
 
 		g.sessionCreated = true;
+		g.eventThreadRun = true;
+		g.eventThread = std::thread(EventPumpMain);
 		LOGI("OpenXR session created");
 		return true;
 	}
@@ -830,6 +847,27 @@ namespace
 			default:
 				break;
 			}
+			// Wake PresentFrame so it stops waiting the instant the session
+			// starts or stops running.
+			g.sessionStateCv.notify_all();
+		}
+	}
+
+	// Owns xrPollEvent on a dedicated thread. Polling from PresentFrame alone is
+	// not enough: pausing the title stops frame submission, so the render thread
+	// never runs again to observe the session becoming active, which left the
+	// app stuck in IDLE until it was killed.
+	void EventPumpMain()
+	{
+		while (g.eventThreadRun.load())
+		{
+			if (g.instance != XR_NULL_HANDLE && g.sessionCreated.load())
+				PumpEvents();
+
+			std::unique_lock<std::mutex> lock(g.sessionStateMutex);
+			g.sessionStateCv.wait_for(lock, std::chrono::milliseconds(4), [] {
+				return !g.eventThreadRun.load();
+			});
 		}
 	}
 
@@ -1229,6 +1267,11 @@ namespace VrRuntime
 		// Let a frame that is already in flight finish before tearing the
 		// session down; PresentFrame checks exitRequested at its entry.
 		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		// Stop polling before the instance/session handles go away.
+		g.eventThreadRun = false;
+		g.sessionStateCv.notify_all();
+		if (g.eventThread.joinable())
+			g.eventThread.join();
 		if (g.sessionRunning)
 		{
 			xrEndSession(g.session);
@@ -1257,11 +1300,19 @@ namespace VrRuntime
 		if (!g.sessionCreated || g.exitRequested)
 			return false;
 
-		PumpEvents();
 		if (!g.sessionRunning)
 		{
+			// The emulator is paused (headset off) or the session has not begun
+			// yet. Wait instead of spinning: the event pump thread wakes us as
+			// soon as the session is running again. Returning false here keeps
+			// the render thread quiet while the headset is idle.
 			static bool logged = false;
-			if (!logged) { LOGI("PresentFrame called before session running; dropping frames"); logged = true; }
+			if (!logged) { LOGI("PresentFrame waiting for a running session"); logged = true; }
+			std::unique_lock<std::mutex> lock(g.sessionStateMutex);
+			g.sessionStateCv.wait_for(lock, std::chrono::milliseconds(50), [] {
+				return g.sessionRunning.load() || !g.eventThreadRun.load() ||
+				       g.exitRequested.load() || !g.sessionCreated.load();
+			});
 			return false;
 		}
 

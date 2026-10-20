@@ -940,6 +940,11 @@ namespace CafeSystem
 		return sSystemRunning;
 	}
 
+	bool IsTitlePaused()
+	{
+		return sTitlePaused;
+	}
+
 	void PauseTitle()
 	{
 		if (!sSystemRunning || sTitlePaused)

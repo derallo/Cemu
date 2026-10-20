@@ -15,6 +15,8 @@
 #include "Cafe/OS/libs/TCL/TCL.h" // TCL currently handles the GPU command ringbuffer
 
 #include "Cafe/CafeSystem.h"
+#include <chrono>
+#include <thread>
 
 #include <boost/container/small_vector.hpp>
 
@@ -191,7 +193,13 @@ uint32 LatteCP_readU32Deprc()
 		// still no command data available, do some other tasks
 		LatteTiming_HandleTimedVsync();
 		LatteAsyncCommands_checkAndExecute();
-		std::this_thread::yield();
+		// The guest is suspended while the title is paused (headset off), so no
+		// commands are coming. Yield the core instead of spinning on it: this is
+		// the other half of the idle CPU burn alongside the scheduler fiber.
+		if (CafeSystem::IsTitlePaused())
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		else
+			std::this_thread::yield();
 		performanceMonitor.gpuTime_idleTime.endMeasuring();
 	}
 	UNREACHABLE;

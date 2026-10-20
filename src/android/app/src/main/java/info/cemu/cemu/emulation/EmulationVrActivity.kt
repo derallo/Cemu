@@ -11,7 +11,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.system.exitProcess
 
@@ -47,7 +46,10 @@ class EmulationVrActivity : EmulationActivity() {
         // rendering at ~90% GPU and heats the headset while nobody is looking
         // at it. Resuming the session resumes the title.
         lifecycleScope.launch {
-            var wasRunning = false
+            // Seed from the live state: starting at "false" made the first poll
+            // fire a pointless resumeTitle() into a session that was already
+            // running.
+            var wasRunning = NativeVr.isSessionRunning()
             while (isActive) {
                 delay(250)
                 if (NativeVr.consumeExitRequest()) {
@@ -59,13 +61,20 @@ class EmulationVrActivity : EmulationActivity() {
                     continue
                 }
                 wasRunning = running
-                withContext(Dispatchers.IO) {
-                    if (running) {
-                        Log.i(TAG, "session resumed; resuming emulation")
-                        NativeEmulation.resumeTitle()
-                    } else {
-                        Log.i(TAG, "session paused; pausing emulation")
-                        NativeEmulation.pauseTitle()
+                // Run the transition off the main thread, but do not let it
+                // wedge this loop: if one call ever blocks, the next
+                // pause/resume must still be observed.
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try {
+                        if (running) {
+                            Log.i(TAG, "session resumed; resuming emulation")
+                            NativeEmulation.resumeTitle()
+                        } else {
+                            Log.i(TAG, "session paused; pausing emulation")
+                            NativeEmulation.pauseTitle()
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "pause/resume transition failed", t)
                     }
                 }
             }
