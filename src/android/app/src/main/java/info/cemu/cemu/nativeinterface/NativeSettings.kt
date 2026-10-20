@@ -75,6 +75,13 @@ object NativeSettings {
     @JvmStatic
     external fun setVrRenderScale(value: Int)
 
+    /** true = the left controller aims the stylus. */
+    @JvmStatic
+    external fun getVrPointerLeft(): Boolean
+
+    @JvmStatic
+    external fun setVrPointerLeft(left: Boolean)
+
     @JvmStatic
     external fun getAccurateBarriers(): Boolean
 

@@ -503,6 +503,8 @@ struct CemuConfig
 	// (100 = 720p, 125 = 900p, 150 = 1080p, 200 = 1440p). Only used by the
 	// Android/OpenXR renderer.
 	ConfigValue<sint32> vr_render_scale{100};
+	// true = the left controller aims the stylus and its trigger touches.
+	ConfigValue<bool> vr_pointer_left{false};
 
 	// audio
 	sint32 audio_api = 0;

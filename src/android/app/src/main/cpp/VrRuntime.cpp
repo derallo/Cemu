@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "VrRuntimeAndroid.h"
+#include "VrCursorShaders.h"
 #include "WindowSystem.h"
 #include "config/CemuConfig.h"
 
@@ -83,6 +84,15 @@ namespace
 	constexpr float kQuadHeight = 1.35f;
 	constexpr float kQuadZ = -2.0f;
 
+	// Must match the push constant block in shaders/cursor.frag.
+	struct CursorPushConstants
+	{
+		float centerX, centerY;
+		float outerRadius, innerRadius;
+		float opacity, pressed;
+		float padding[2];
+	};
+
 	struct VrState
 	{
 		bool initialized = false;
@@ -129,12 +139,12 @@ namespace
 		VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 		VkFence frameFence = VK_NULL_HANDLE;
 
-		// 2x1-pixel solid images used to draw the "where am I pointing" cursor
-		// (black ring + white centre) straight into the presented frame.
-		VkImage cursorImageBlack = VK_NULL_HANDLE;
-		VkDeviceMemory cursorMemoryBlack = VK_NULL_HANDLE;
-		VkImage cursorImageWhite = VK_NULL_HANDLE;
-		VkDeviceMemory cursorMemoryWhite = VK_NULL_HANDLE;
+		// Reticle: alpha-blended circle drawn into the presented frame.
+		VkRenderPass cursorRenderPass = VK_NULL_HANDLE;
+		VkPipelineLayout cursorPipelineLayout = VK_NULL_HANDLE;
+		VkPipeline cursorPipeline = VK_NULL_HANDLE;
+		std::vector<VkImageView> swapchainViews;
+		std::vector<VkFramebuffer> cursorFramebuffers;
 
 		XrActionSet actionSet = XR_NULL_HANDLE;
 		XrAction triggerLeft = XR_NULL_HANDLE;
@@ -172,6 +182,7 @@ namespace
 		float pointerU = 0.0f;
 		float pointerV = 0.0f;
 		bool screenIsGamePad = true; // GamePad (DRC) instead of TV
+		bool pointerLeft = false;    // left controller drives the stylus
 		bool viewChordLatched = false;
 		bool viewChordFired = false;
 		std::chrono::steady_clock::time_point viewChordStart{};
@@ -504,84 +515,232 @@ namespace
 		return true;
 	}
 
-	bool CreateSolidCursorImage(VkImage& image, VkDeviceMemory& memory, float red, float green, float blue)
+	// The old cursor was two 1x1 blits (a black square plus a white square).
+	// A blit cannot blend, so a round, translucent reticle needs a real draw:
+	// one alpha-blended full-screen triangle whose fragment shader computes a
+	// soft-edged disc. The SPIR-V lives in VrCursorShaders.h.
+	bool CreateCursorResources()
 	{
-		VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-		info.imageType = VK_IMAGE_TYPE_2D;
-		// Must match the swapchain so vkCmdBlitImage stays format-compatible.
-		info.format = g.colorFormat;
-		info.extent = {1, 1, 1};
-		info.mipLevels = 1;
-		info.arrayLayers = 1;
-		info.samples = VK_SAMPLE_COUNT_1_BIT;
-		info.tiling = VK_IMAGE_TILING_OPTIMAL;
-		info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-		info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-		info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-		if (vkCreateImage(g.vkDevice, &info, nullptr, &image) != VK_SUCCESS)
-			return false;
+		g.swapchainViews.clear();
+		g.cursorFramebuffers.clear();
 
-		VkMemoryRequirements requirements;
-		vkGetImageMemoryRequirements(g.vkDevice, image, &requirements);
-		VkPhysicalDeviceMemoryProperties memoryProperties;
-		vkGetPhysicalDeviceMemoryProperties(g.vkPhysicalDevice, &memoryProperties);
-		uint32_t memoryType = UINT32_MAX;
-		for (uint32_t t = 0; t < memoryProperties.memoryTypeCount; t++)
+		for (VkImage image : g.swapchainImages)
 		{
-			if ((requirements.memoryTypeBits & (1u << t)) &&
-				(memoryProperties.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+			VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+			viewInfo.image = image;
+			viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+			viewInfo.format = g.colorFormat;
+			viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+			VkImageView view = VK_NULL_HANDLE;
+			if (vkCreateImageView(g.vkDevice, &viewInfo, nullptr, &view) != VK_SUCCESS)
 			{
-				memoryType = t;
-				break;
+				LOGE("reticle: vkCreateImageView failed");
+				return false;
 			}
+			g.swapchainViews.push_back(view);
 		}
-		if (memoryType == UINT32_MAX)
+
+		VkAttachmentDescription attachment{};
+		attachment.format = g.colorFormat;
+		attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+		attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; // keep the emulated frame
+		attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+		VkAttachmentReference colorRef{};
+		colorRef.attachment = 0;
+		colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+		VkSubpassDescription subpass{};
+		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		subpass.colorAttachmentCount = 1;
+		subpass.pColorAttachments = &colorRef;
+
+		VkSubpassDependency dependency{};
+		dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+		dependency.dstSubpass = 0;
+		dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		dependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+
+		VkRenderPassCreateInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+		renderPassInfo.attachmentCount = 1;
+		renderPassInfo.pAttachments = &attachment;
+		renderPassInfo.subpassCount = 1;
+		renderPassInfo.pSubpasses = &subpass;
+		renderPassInfo.dependencyCount = 1;
+		renderPassInfo.pDependencies = &dependency;
+		if (vkCreateRenderPass(g.vkDevice, &renderPassInfo, nullptr, &g.cursorRenderPass) != VK_SUCCESS)
+		{
+			LOGE("reticle: vkCreateRenderPass failed");
 			return false;
-		VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-		allocateInfo.allocationSize = requirements.size;
-		allocateInfo.memoryTypeIndex = memoryType;
-		if (vkAllocateMemory(g.vkDevice, &allocateInfo, nullptr, &memory) != VK_SUCCESS)
+		}
+
+		for (VkImageView view : g.swapchainViews)
+		{
+			VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+			framebufferInfo.renderPass = g.cursorRenderPass;
+			framebufferInfo.attachmentCount = 1;
+			framebufferInfo.pAttachments = &view;
+			framebufferInfo.width = g.extent.width;
+			framebufferInfo.height = g.extent.height;
+			framebufferInfo.layers = 1;
+			VkFramebuffer framebuffer = VK_NULL_HANDLE;
+			if (vkCreateFramebuffer(g.vkDevice, &framebufferInfo, nullptr, &framebuffer) != VK_SUCCESS)
+			{
+				LOGE("reticle: vkCreateFramebuffer failed");
+				return false;
+			}
+			g.cursorFramebuffers.push_back(framebuffer);
+		}
+
+		VkShaderModule vert = VK_NULL_HANDLE;
+		VkShaderModule frag = VK_NULL_HANDLE;
+		{
+			VkShaderModuleCreateInfo shaderInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+			shaderInfo.codeSize = sizeof(kCursorVertexSpirv);
+			shaderInfo.pCode = reinterpret_cast<const uint32_t*>(kCursorVertexSpirv);
+			if (vkCreateShaderModule(g.vkDevice, &shaderInfo, nullptr, &vert) != VK_SUCCESS)
+				vert = VK_NULL_HANDLE;
+			shaderInfo.codeSize = sizeof(kCursorFragmentSpirv);
+			shaderInfo.pCode = reinterpret_cast<const uint32_t*>(kCursorFragmentSpirv);
+			if (vkCreateShaderModule(g.vkDevice, &shaderInfo, nullptr, &frag) != VK_SUCCESS)
+				frag = VK_NULL_HANDLE;
+		}
+		if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE)
+		{
+			LOGE("reticle: vkCreateShaderModule failed");
+			if (vert != VK_NULL_HANDLE)
+				vkDestroyShaderModule(g.vkDevice, vert, nullptr);
+			if (frag != VK_NULL_HANDLE)
+				vkDestroyShaderModule(g.vkDevice, frag, nullptr);
 			return false;
-		vkBindImageMemory(g.vkDevice, image, memory, 0);
+		}
 
-		VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-		vkResetCommandBuffer(g.commandBuffer, 0);
-		vkBeginCommandBuffer(g.commandBuffer, &beginInfo);
+		VkPipelineShaderStageCreateInfo stages[2]{};
+		stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+		stages[0].module = vert;
+		stages[0].pName = "main";
+		stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+		stages[1].module = frag;
+		stages[1].pName = "main";
 
-		VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-		barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-		barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.image = image;
-		barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-		barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		vkCmdPipelineBarrier(g.commandBuffer, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-			0, 0, nullptr, 0, nullptr, 1, &barrier);
+		VkPushConstantRange pushRange{};
+		pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+		pushRange.size = sizeof(CursorPushConstants);
 
-		VkClearColorValue color{};
-		color.float32[0] = red;
-		color.float32[1] = green;
-		color.float32[2] = blue;
-		color.float32[3] = 1.0f;
-		VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-		vkCmdClearColorImage(g.commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+		VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+		layoutInfo.pushConstantRangeCount = 1;
+		layoutInfo.pPushConstantRanges = &pushRange;
+		const bool layoutOk = vkCreatePipelineLayout(g.vkDevice, &layoutInfo, nullptr, &g.cursorPipelineLayout) == VK_SUCCESS;
 
-		barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-		barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-		vkCmdPipelineBarrier(g.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-			0, 0, nullptr, 0, nullptr, 1, &barrier);
+		VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
 
-		vkEndCommandBuffer(g.commandBuffer);
-		VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-		submit.commandBufferCount = 1;
-		submit.pCommandBuffers = &g.commandBuffer;
-		vkQueueSubmit(g.queue, 1, &submit, VK_NULL_HANDLE);
-		vkDeviceWaitIdle(g.vkDevice);
+		VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+		inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+		VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+		viewportState.viewportCount = 1;
+		viewportState.scissorCount = 1;
+
+		VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+		raster.polygonMode = VK_POLYGON_MODE_FILL;
+		raster.cullMode = VK_CULL_MODE_NONE;
+		raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+		raster.lineWidth = 1.0f;
+
+		VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+		multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+		VkPipelineDepthStencilStateCreateInfo depthStencil{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+
+		VkPipelineColorBlendAttachmentState blendAttachment{};
+		blendAttachment.blendEnable = VK_TRUE;
+		blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+		blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+		blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+		blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+		blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+		blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+			VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+		VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+		blend.attachmentCount = 1;
+		blend.pAttachments = &blendAttachment;
+
+		const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+		VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+		dynamic.dynamicStateCount = 2;
+		dynamic.pDynamicStates = dynamicStates;
+
+		VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+		pipelineInfo.stageCount = 2;
+		pipelineInfo.pStages = stages;
+		pipelineInfo.pVertexInputState = &vertexInput;
+		pipelineInfo.pInputAssemblyState = &inputAssembly;
+		pipelineInfo.pViewportState = &viewportState;
+		pipelineInfo.pRasterizationState = &raster;
+		pipelineInfo.pMultisampleState = &multisample;
+		pipelineInfo.pDepthStencilState = &depthStencil;
+		pipelineInfo.pColorBlendState = &blend;
+		pipelineInfo.pDynamicState = &dynamic;
+		pipelineInfo.layout = g.cursorPipelineLayout;
+		pipelineInfo.renderPass = g.cursorRenderPass;
+		pipelineInfo.subpass = 0;
+
+		const VkResult pipelineResult = layoutOk
+			? vkCreateGraphicsPipelines(g.vkDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &g.cursorPipeline)
+			: VK_ERROR_INITIALIZATION_FAILED;
+
+		vkDestroyShaderModule(g.vkDevice, vert, nullptr);
+		vkDestroyShaderModule(g.vkDevice, frag, nullptr);
+
+		if (!layoutOk || pipelineResult != VK_SUCCESS)
+		{
+			LOGE("reticle: pipeline creation failed (%d)", (int)pipelineResult);
+			return false;
+		}
+		LOGI("reticle pipeline ready (%u swapchain views)", (uint32)g.swapchainViews.size());
 		return true;
+	}
+
+	// Only used to unwind a partial CreateCursorResources() failure. At shutdown
+	// the process ends right after the session, so the objects are left to the
+	// driver rather than risking a destroy while a frame is still in flight.
+	void DestroyCursorResources()
+	{
+		for (VkFramebuffer framebuffer : g.cursorFramebuffers)
+			if (framebuffer != VK_NULL_HANDLE)
+				vkDestroyFramebuffer(g.vkDevice, framebuffer, nullptr);
+		g.cursorFramebuffers.clear();
+
+		for (VkImageView view : g.swapchainViews)
+			if (view != VK_NULL_HANDLE)
+				vkDestroyImageView(g.vkDevice, view, nullptr);
+		g.swapchainViews.clear();
+
+		if (g.cursorPipeline != VK_NULL_HANDLE)
+		{
+			vkDestroyPipeline(g.vkDevice, g.cursorPipeline, nullptr);
+			g.cursorPipeline = VK_NULL_HANDLE;
+		}
+		if (g.cursorPipelineLayout != VK_NULL_HANDLE)
+		{
+			vkDestroyPipelineLayout(g.vkDevice, g.cursorPipelineLayout, nullptr);
+			g.cursorPipelineLayout = VK_NULL_HANDLE;
+		}
+		if (g.cursorRenderPass != VK_NULL_HANDLE)
+		{
+			vkDestroyRenderPass(g.vkDevice, g.cursorRenderPass, nullptr);
+			g.cursorRenderPass = VK_NULL_HANDLE;
+		}
 	}
 
 	bool CreateFrameResources()
@@ -613,13 +772,12 @@ namespace
 			return false;
 		}
 
-		if (!CreateSolidCursorImage(g.cursorImageBlack, g.cursorMemoryBlack, 0.0f, 0.0f, 0.0f) ||
-			!CreateSolidCursorImage(g.cursorImageWhite, g.cursorMemoryWhite, 1.0f, 1.0f, 1.0f))
+		// The reticle is cosmetic: if its resources cannot be created, keep
+		// presenting frames without a cursor.
+		if (!CreateCursorResources())
 		{
-			// The cursor is cosmetic; keep rendering even if it cannot be created.
-			LOGE("failed to create cursor images");
-			g.cursorImageBlack = VK_NULL_HANDLE;
-			g.cursorImageWhite = VK_NULL_HANDLE;
+			LOGE("failed to create reticle resources; continuing without a cursor");
+			DestroyCursorResources();
 		}
 		return true;
 	}
@@ -754,6 +912,10 @@ namespace VrRuntime
 		g.extent.height = ((720u * static_cast<uint32>(renderScale)) / 100u + 1u) & ~1u;
 		LOGI("VR render scale: %d%% (%ux%u)", renderScale, g.extent.width, g.extent.height);
 
+		// Which controller drives the reticle and the stylus.
+		g.pointerLeft = GetConfig().vr_pointer_left.GetValue();
+		LOGI("VR pointer hand: %s", g.pointerLeft ? "left" : "right");
+
 		// The runtime requires this query before xrCreateSession and the returned
 		// physical device must be the one used for the session binding.
 		VkPhysicalDevice runtimePhysicalDevice = VK_NULL_HANDLE;
@@ -809,11 +971,12 @@ namespace VrRuntime
 	// (e.g. Kirby and the Rainbow Curse) are otherwise completely unresponsive.
 	void UpdateScreenTouch(XrTime displayTime)
 	{
-		if (g.aimSpaceRight == XR_NULL_HANDLE)
+		const XrSpace aimSpace = g.pointerLeft ? g.aimSpaceLeft : g.aimSpaceRight;
+		if (aimSpace == XR_NULL_HANDLE)
 			return;
 
 		XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
-		const XrResult result = xrLocateSpace(g.aimSpaceRight, g.localSpace, displayTime, &location);
+		const XrResult result = xrLocateSpace(aimSpace, g.localSpace, displayTime, &location);
 		const bool poseValid = XR_SUCCEEDED(result) &&
 			(location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
 			(location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
@@ -852,7 +1015,8 @@ namespace VrRuntime
 			g.pointerV = v;
 		}
 
-		const bool press = hit && g.screenIsGamePad && GetFloat(g.triggerRight) > 0.5f;
+		const bool press = hit && g.screenIsGamePad &&
+			GetFloat(g.pointerLeft ? g.triggerLeft : g.triggerRight) > 0.5f;
 		if (press)
 		{
 			g.touchX = std::clamp((sint32)std::lround(u * (float)g.extent.width), 0, (sint32)g.extent.width - 1);
@@ -1175,46 +1339,73 @@ namespace VrRuntime
 			g.swapchainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			1, &region, VK_FILTER_LINEAR);
 
-		// Cursor: a small black disc with a white centre at the point where the
-		// right controller ray meets the screen, so the player can see where the
-		// stylus will land. Drawn straight into the presented image (no extra
-		// composition layer required).
-		if (g.pointerOnScreen && g.cursorImageBlack != VK_NULL_HANDLE)
+		// Reticle: a round, semi-transparent cursor at the point where the
+		// pointer ray meets the screen. Alpha blending lets it read over any
+		// scene without hiding what is underneath.
+		bool cursorDrawn = false;
+		if (g.pointerOnScreen && g.cursorPipeline != VK_NULL_HANDLE &&
+			imageIndex < g.cursorFramebuffers.size())
 		{
-			const sint32 px = std::clamp((sint32)std::lround(g.pointerU * (float)g.swapchainWidth), 0, (sint32)g.swapchainWidth - 1);
-			const sint32 py = std::clamp((sint32)std::lround(g.pointerV * (float)g.swapchainHeight), 0, (sint32)g.swapchainHeight - 1);
-			const sint32 outerHalf = g.touchActive ? 13 : 10;
-			const sint32 innerHalf = g.touchActive ? 8 : 5;
-			auto blitDot = [&](VkImage source, sint32 half)
+			const float centerX = g.pointerU * (float)g.swapchainWidth;
+			const float centerY = g.pointerV * (float)g.swapchainHeight;
+			// Keep the reticle at a similar apparent size at every VR
+			// resolution; 720p is the reference.
+			const float scale = (float)g.swapchainHeight / 720.0f;
+			const float outerRadius = (g.touchActive ? 14.0f : 11.0f) * scale;
+			const float innerRadius = (g.touchActive ? 7.0f : 4.5f) * scale;
+			const float margin = outerRadius + 2.0f;
+
+			const sint32 x0 = std::clamp((sint32)std::floor(centerX - margin), 0, (sint32)g.swapchainWidth);
+			const sint32 y0 = std::clamp((sint32)std::floor(centerY - margin), 0, (sint32)g.swapchainHeight);
+			const sint32 x1 = std::clamp((sint32)std::ceil(centerX + margin), 0, (sint32)g.swapchainWidth);
+			const sint32 y1 = std::clamp((sint32)std::ceil(centerY + margin), 0, (sint32)g.swapchainHeight);
+
+			if (x1 > x0 && y1 > y0)
 			{
-				const sint32 x0 = std::clamp(px - half, 0, (sint32)g.swapchainWidth);
-				const sint32 x1 = std::clamp(px + half, 0, (sint32)g.swapchainWidth);
-				const sint32 y0 = std::clamp(py - half, 0, (sint32)g.swapchainHeight);
-				const sint32 y1 = std::clamp(py + half, 0, (sint32)g.swapchainHeight);
-				if (x1 <= x0 || y1 <= y0)
-					return;
-				VkImageBlit dot{};
-				dot.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-				dot.srcOffsets[0] = {0, 0, 0};
-				dot.srcOffsets[1] = {1, 1, 1};
-				dot.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-				dot.dstOffsets[0] = {x0, y0, 0};
-				dot.dstOffsets[1] = {x1, y1, 1};
-				vkCmdBlitImage(g.commandBuffer, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-					g.swapchainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-					1, &dot, VK_FILTER_NEAREST);
-			};
-			blitDot(g.cursorImageBlack, outerHalf);
-			blitDot(g.cursorImageWhite, innerHalf);
+				VkImageMemoryBarrier toAttachment = barriers[1];
+				toAttachment.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+				toAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+				toAttachment.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+				toAttachment.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+				vkCmdPipelineBarrier(g.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toAttachment);
+
+				VkRenderPassBeginInfo passBegin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+				passBegin.renderPass = g.cursorRenderPass;
+				passBegin.framebuffer = g.cursorFramebuffers[imageIndex];
+				passBegin.renderArea = {{0, 0}, {g.swapchainWidth, g.swapchainHeight}};
+				vkCmdBeginRenderPass(g.commandBuffer, &passBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+				const VkViewport viewport{0.0f, 0.0f, (float)g.swapchainWidth, (float)g.swapchainHeight, 0.0f, 1.0f};
+				const VkRect2D scissor{{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+				vkCmdSetViewport(g.commandBuffer, 0, 1, &viewport);
+				vkCmdSetScissor(g.commandBuffer, 0, 1, &scissor);
+				vkCmdBindPipeline(g.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g.cursorPipeline);
+
+				CursorPushConstants push{};
+				push.centerX = centerX;
+				push.centerY = centerY;
+				push.outerRadius = outerRadius;
+				push.innerRadius = innerRadius;
+				push.opacity = 0.55f;
+				push.pressed = g.touchActive ? 1.0f : 0.0f;
+				vkCmdPushConstants(g.commandBuffer, g.cursorPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+					0, sizeof(push), &push);
+
+				vkCmdDraw(g.commandBuffer, 3, 1, 0, 0);
+				vkCmdEndRenderPass(g.commandBuffer);
+				cursorDrawn = true;
+			}
 		}
 
 		VkImageMemoryBarrier toSampled = barriers[1];
-		toSampled.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		toSampled.oldLayout = cursorDrawn ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 		toSampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		toSampled.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		toSampled.srcAccessMask = cursorDrawn ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
 		toSampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		vkCmdPipelineBarrier(g.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-			0, 0, nullptr, 0, nullptr, 1, &toSampled);
+		vkCmdPipelineBarrier(g.commandBuffer,
+			cursorDrawn ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSampled);
 
 		vkEndCommandBuffer(g.commandBuffer);
 

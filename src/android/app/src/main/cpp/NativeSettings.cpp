@@ -276,6 +276,18 @@ Java_info_cemu_cemu_nativeinterface_NativeSettings_getVrRenderScale([[maybe_unus
 }
 
 extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeSettings_setVrPointerLeft([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz, jboolean left)
+{
+	GetConfig().vr_pointer_left = left;
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT jboolean JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeSettings_getVrPointerLeft([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
+{
+	return GetConfig().vr_pointer_left;
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
 Java_info_cemu_cemu_nativeinterface_NativeSettings_setAccurateBarriers([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz, jboolean enabled)
 {
 	GetConfig().vk_accurate_barriers = enabled;

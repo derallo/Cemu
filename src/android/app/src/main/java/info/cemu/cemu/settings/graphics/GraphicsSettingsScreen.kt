@@ -79,6 +79,13 @@ fun GraphicsSettingsScreen(navigateBack: () -> Unit, goToCustomDriversSettings: 
             choices = VrRenderScaleChoices,
         )
         SingleSelection(
+            label = tr("VR pointer hand"),
+            initialChoice = { if (NativeSettings.getVrPointerLeft()) 1 else 0 },
+            onChoiceChanged = { NativeSettings.setVrPointerLeft(it == 1) },
+            choiceToString = { if (it == 1) tr("Left hand") else tr("Right hand") },
+            choices = listOf(0, 1),
+        )
+        SingleSelection(
             label = tr("Upscale filter"),
             initialChoice = NativeSettings::getUpscalingFilter,
             onChoiceChanged = NativeSettings::setUpscalingFilter,
