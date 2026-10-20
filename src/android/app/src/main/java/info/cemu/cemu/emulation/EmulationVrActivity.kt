@@ -7,9 +7,11 @@ import androidx.lifecycle.lifecycleScope
 import info.cemu.cemu.MainActivity
 import info.cemu.cemu.nativeinterface.NativeEmulation
 import info.cemu.cemu.nativeinterface.NativeVr
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.system.exitProcess
 
@@ -39,13 +41,32 @@ class EmulationVrActivity : EmulationActivity() {
         }
         runsEmulation = true
 
-        // Both thumbsticks = leave VR and return to the library.
+        // Both thumbsticks = leave VR and return to the library. The same loop
+        // pauses emulation whenever Horizon OS pauses the OpenXR session (for
+        // example when the headset is taken off): otherwise the game keeps
+        // rendering at ~90% GPU and heats the headset while nobody is looking
+        // at it. Resuming the session resumes the title.
         lifecycleScope.launch {
+            var wasRunning = false
             while (isActive) {
                 delay(250)
                 if (NativeVr.consumeExitRequest()) {
                     stopEmulationAndFinish()
                     break
+                }
+                val running = NativeVr.isSessionRunning()
+                if (running == wasRunning) {
+                    continue
+                }
+                wasRunning = running
+                withContext(Dispatchers.IO) {
+                    if (running) {
+                        Log.i(TAG, "session resumed; resuming emulation")
+                        NativeEmulation.resumeTitle()
+                    } else {
+                        Log.i(TAG, "session paused; pausing emulation")
+                        NativeEmulation.pauseTitle()
+                    }
                 }
             }
         }

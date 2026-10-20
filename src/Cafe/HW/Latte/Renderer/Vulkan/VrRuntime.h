@@ -17,6 +17,10 @@ namespace VrRuntime
 	// True when the session exists and external color images are ready.
 	bool IsSessionReady();
 
+	// True while the OpenXR session is running (between xrBeginSession and
+	// xrEndSession). False when the headset pauses the app (session IDLE).
+	bool IsSessionRunning();
+
 	// Extensions that must be enabled on Cemu's VkInstance / VkDevice.
 	void AppendInstanceExtensions(std::vector<const char*>& extensions);
 	void AppendDeviceExtensions(std::vector<const char*>& extensions);

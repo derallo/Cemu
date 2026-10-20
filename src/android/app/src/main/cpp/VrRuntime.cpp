@@ -876,6 +876,11 @@ namespace VrRuntime
 		return g.sessionCreated && !g.colorImages.empty();
 	}
 
+	bool IsSessionRunning()
+	{
+		return g.sessionRunning;
+	}
+
 	void AppendInstanceExtensions(std::vector<const char*>& extensions)
 	{
 		if (!g.initialized)
