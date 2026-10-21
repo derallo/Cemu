@@ -1,9 +1,14 @@
 package info.cemu.cemu.emulation
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Bundle
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import info.cemu.cemu.BuildConfig
 import info.cemu.cemu.MainActivity
 import info.cemu.cemu.nativeinterface.NativeEmulation
 import info.cemu.cemu.nativeinterface.NativeVr
@@ -26,6 +31,20 @@ class EmulationVrActivity : EmulationActivity() {
     /** Guards against a second teardown from onDestroy after the exit gesture. */
     private val teardownStarted = AtomicBoolean(false)
 
+    /**
+     * Deterministic exit for automation and for a paused session: BACK does
+     * not reach this activity in VR and the both-sticks gesture needs a
+     * running session, but a broadcast arrives in both states.
+     * `adb shell am broadcast -a <applicationId>.EXIT_VR`
+     */
+    private val exitReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            Log.i(TAG, "exit broadcast received")
+            stopEmulationAndFinish()
+        }
+    }
+    private var exitReceiverRegistered = false
+
     override fun isVrMode(): Boolean = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -39,6 +58,26 @@ class EmulationVrActivity : EmulationActivity() {
             return
         }
         runsEmulation = true
+
+        // Exported so `adb shell am broadcast` can reach it; receiving it can
+        // only stop the game, never start anything.
+        ContextCompat.registerReceiver(
+            this,
+            exitReceiver,
+            IntentFilter(ACTION_EXIT_VR),
+            ContextCompat.RECEIVER_EXPORTED,
+        )
+        exitReceiverRegistered = true
+
+        // A BACK that does reach the activity exits VR deterministically too.
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : androidx.activity.OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    stopEmulationAndFinish()
+                }
+            },
+        )
 
         // Both thumbsticks = leave VR and return to the library. The same loop
         // pauses emulation whenever Horizon OS pauses the OpenXR session (for
@@ -82,6 +121,10 @@ class EmulationVrActivity : EmulationActivity() {
     }
 
     override fun onDestroy() {
+        if (exitReceiverRegistered) {
+            unregisterReceiver(exitReceiver)
+            exitReceiverRegistered = false
+        }
         super.onDestroy()
         if (isFinishing && runsEmulation) {
             stopEmulation()
@@ -145,5 +188,8 @@ class EmulationVrActivity : EmulationActivity() {
     companion object {
         private const val TAG = "CemuVr"
         private const val TEARDOWN_TIMEOUT_MS = 6_000L
+
+        /** Broadcast action that exits VR; also used by scripts/quest-eval.sh. */
+        val ACTION_EXIT_VR: String = BuildConfig.APPLICATION_ID + ".EXIT_VR"
     }
 }

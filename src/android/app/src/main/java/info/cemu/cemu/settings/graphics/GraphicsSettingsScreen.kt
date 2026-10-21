@@ -18,6 +18,7 @@ private val ScalingFilterChoices = listOf(
 )
 
 private val VrRenderScaleChoices = listOf(
+    NativeSettings.VrRenderScale.AUTO,
     NativeSettings.VrRenderScale.PERCENT_100,
     NativeSettings.VrRenderScale.PERCENT_125,
     NativeSettings.VrRenderScale.PERCENT_150,
@@ -103,6 +104,7 @@ fun GraphicsSettingsScreen(navigateBack: () -> Unit, goToCustomDriversSettings: 
 }
 
 private fun vrRenderScaleToString(scale: Int) = when (scale) {
+    NativeSettings.VrRenderScale.AUTO -> tr("Auto (runtime recommended)")
     NativeSettings.VrRenderScale.PERCENT_100 -> tr("Standard (720p)")
     NativeSettings.VrRenderScale.PERCENT_125 -> tr("125% (900p)")
     NativeSettings.VrRenderScale.PERCENT_150 -> tr("150% (1080p)")

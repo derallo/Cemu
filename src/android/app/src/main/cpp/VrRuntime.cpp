@@ -16,9 +16,9 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
-#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdarg>
@@ -148,8 +148,27 @@ namespace
 		uint32_t swapchainHeight = 720;
 
 		VkCommandPool commandPool = VK_NULL_HANDLE;
-		VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-		VkFence frameFence = VK_NULL_HANDLE;
+		// Two present slots rotate so the CPU can record the next blit while
+		// the previous one is still executing on the GPU.
+		std::array<VkCommandBuffer, 2> commandBuffers{VK_NULL_HANDLE, VK_NULL_HANDLE};
+		std::array<VkFence, 2> frameFences{VK_NULL_HANDLE, VK_NULL_HANDLE};
+		uint32_t frameSlot = 0;
+
+		// Per-view sizes reported by the runtime (per eye, PRIMARY_STEREO).
+		uint32_t recommendedWidth = 0;
+		uint32_t recommendedHeight = 0;
+		uint32_t maxWidth = 0;
+		uint32_t maxHeight = 0;
+
+		// Frame-interval samples for the once-per-second histogram line.
+		std::vector<float> frameIntervalsMs;
+		std::chrono::steady_clock::time_point lastFrameAt{};
+		std::chrono::steady_clock::time_point frameStatsWindowStart{};
+		bool haveLastFrame = false;
+		uint32_t droppedInWindow = 0;
+
+		XrPath handLeftPath = XR_NULL_PATH;
+		XrPath handRightPath = XR_NULL_PATH;
 
 		// Reticle: alpha-blended circle drawn into the presented frame.
 		VkRenderPass cursorRenderPass = VK_NULL_HANDLE;
@@ -355,8 +374,8 @@ namespace
 		suggested.countSuggestedBindings = (uint32_t)bindings.size();
 		suggested.suggestedBindings = bindings.data();
 
-		(void)leftHand;
-		(void)rightHand;
+		g.handLeftPath = leftHand;
+		g.handRightPath = rightHand;
 		return XrOk(xrSuggestInteractionProfileBindings(g.instance, &suggested), "xrSuggestInteractionProfileBindings");
 	}
 
@@ -774,8 +793,8 @@ namespace
 		VkCommandBufferAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
 		allocateInfo.commandPool = g.commandPool;
 		allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-		allocateInfo.commandBufferCount = 1;
-		if (vkAllocateCommandBuffers(g.vkDevice, &allocateInfo, &g.commandBuffer) != VK_SUCCESS)
+		allocateInfo.commandBufferCount = (uint32_t)g.commandBuffers.size();
+		if (vkAllocateCommandBuffers(g.vkDevice, &allocateInfo, g.commandBuffers.data()) != VK_SUCCESS)
 		{
 			LOGE("vkAllocateCommandBuffers failed");
 			return false;
@@ -783,10 +802,13 @@ namespace
 
 		VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 		fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-		if (vkCreateFence(g.vkDevice, &fenceInfo, nullptr, &g.frameFence) != VK_SUCCESS)
+		for (VkFence& fence : g.frameFences)
 		{
-			LOGE("vkCreateFence failed");
-			return false;
+			if (vkCreateFence(g.vkDevice, &fenceInfo, nullptr, &fence) != VK_SUCCESS)
+			{
+				LOGE("vkCreateFence failed");
+				return false;
+			}
 		}
 
 		// The reticle is cosmetic: if its resources cannot be created, keep
@@ -900,6 +922,66 @@ namespace
 			return {0.0f, 0.0f};
 		return state.isActive ? state.currentState : XrVector2f{0.0f, 0.0f};
 	}
+
+	// One consistent snapshot per xrSyncActions call. Reading every action
+	// separately for mapping, logging and edge detection was dozens of
+	// xrGetActionState* calls per frame and could mix two sync generations.
+	struct InputSnapshot
+	{
+		bool a = false, b = false, x = false, y = false, menu = false;
+		bool stickClickL = false, stickClickR = false;
+		float triggerL = 0.0f, triggerR = 0.0f;
+		float squeezeL = 0.0f, squeezeR = 0.0f;
+		XrVector2f stickL{0.0f, 0.0f}, stickR{0.0f, 0.0f};
+	};
+
+	float ApplyStickDeadzone(float value)
+	{
+		constexpr float kDeadzone = 0.15f;
+		const float magnitude = std::fabs(value);
+		if (magnitude <= kDeadzone)
+			return 0.0f;
+		return std::copysign((magnitude - kDeadzone) / (1.0f - kDeadzone), value);
+	}
+
+	XrVector2f ApplyStickDeadzone(XrVector2f value)
+	{
+		return {ApplyStickDeadzone(value.x), ApplyStickDeadzone(value.y)};
+	}
+
+	InputSnapshot ReadInputSnapshot()
+	{
+		InputSnapshot s;
+		s.a = GetBool(g.buttonA);
+		s.b = GetBool(g.buttonB);
+		s.x = GetBool(g.buttonX);
+		s.y = GetBool(g.buttonY);
+		s.menu = GetBool(g.menuButton);
+		s.stickClickL = GetBool(g.stickClickLeft);
+		s.stickClickR = GetBool(g.stickClickRight);
+		s.triggerL = GetFloat(g.triggerLeft);
+		s.triggerR = GetFloat(g.triggerRight);
+		s.squeezeL = GetFloat(g.squeezeLeft);
+		s.squeezeR = GetFloat(g.squeezeRight);
+		s.stickL = ApplyStickDeadzone(GetVector2(g.thumbstickLeft));
+		s.stickR = ApplyStickDeadzone(GetVector2(g.thumbstickRight));
+		return s;
+	}
+
+	void TriggerStylusHaptic()
+	{
+		if (g.session == XR_NULL_HANDLE)
+			return;
+		XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};
+		info.action = g.pointerLeft ? g.triggerLeft : g.triggerRight;
+		info.subactionPath = g.pointerLeft ? g.handLeftPath : g.handRightPath;
+		XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
+		vibration.amplitude = 0.5f;
+		vibration.duration = 20'000'000; // 20 ms, in nanoseconds
+		vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
+		xrApplyHapticFeedback(g.session, &info,
+			reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+	}
 }
 
 namespace VrRuntime
@@ -950,10 +1032,31 @@ namespace VrRuntime
 		// Presentation resolution for both the emulator color images and the XR
 		// swapchain. This makes the virtual screen sharper; the game's own
 		// render targets only gain real detail from a resolution graphic pack.
-		const sint32 renderScale = std::clamp(GetConfig().vr_render_scale.GetValue(), 100, 200);
-		g.extent.width = ((1280u * static_cast<uint32>(renderScale)) / 100u + 1u) & ~1u;
-		g.extent.height = ((720u * static_cast<uint32>(renderScale)) / 100u + 1u) & ~1u;
-		LOGI("VR render scale: %d%% (%ux%u)", renderScale, g.extent.width, g.extent.height);
+		const sint32 renderScale = std::clamp(GetConfig().vr_render_scale.GetValue(), 0, 200);
+		if (renderScale == 0 && g.recommendedWidth > 0)
+		{
+			// Auto: present the 16:9 quad at the runtime's recommended
+			// per-eye width, keeping the quad's aspect ratio.
+			g.extent.width = g.recommendedWidth & ~1u;
+			g.extent.height = ((g.extent.width * 9u) / 16u + 1u) & ~1u;
+			LOGI("VR render scale: auto/recommended (%ux%u)", g.extent.width, g.extent.height);
+		}
+		else
+		{
+			const sint32 scale = renderScale == 0 ? 100 : renderScale;
+			g.extent.width = ((1280u * static_cast<uint32>(scale)) / 100u + 1u) & ~1u;
+			g.extent.height = ((720u * static_cast<uint32>(scale)) / 100u + 1u) & ~1u;
+			LOGI("VR render scale: %d%% (%ux%u)", scale, g.extent.width, g.extent.height);
+		}
+		if (g.maxWidth > 0 && g.maxHeight > 0 &&
+			(g.extent.width > g.maxWidth || g.extent.height > g.maxHeight))
+		{
+			g.extent.width = std::min(g.extent.width, g.maxWidth) & ~1u;
+			g.extent.height = std::min(g.extent.height, g.maxHeight) & ~1u;
+			LOGI("VR extent clamped to runtime maximum (%ux%u)", g.extent.width, g.extent.height);
+		}
+		if (g.recommendedWidth > 0)
+			LOGI("runtime recommended per-eye: %ux%u (max %ux%u)", g.recommendedWidth, g.recommendedHeight, g.maxWidth, g.maxHeight);
 
 		// Which controller drives the reticle and the stylus.
 		g.pointerLeft = GetConfig().vr_pointer_left.GetValue();
@@ -1012,7 +1115,7 @@ namespace VrRuntime
 	// Maps the right controller ray onto the virtual screen and turns the right
 	// trigger into a stylus. Games that are played on the GamePad touchscreen
 	// (e.g. Kirby and the Rainbow Curse) are otherwise completely unresponsive.
-	void UpdateScreenTouch(XrTime displayTime)
+	void UpdateScreenTouch(XrTime displayTime, float triggerValue)
 	{
 		const XrSpace aimSpace = g.pointerLeft ? g.aimSpaceLeft : g.aimSpaceRight;
 		if (aimSpace == XR_NULL_HANDLE)
@@ -1058,15 +1161,17 @@ namespace VrRuntime
 			g.pointerV = v;
 		}
 
-		const bool press = hit && g.screenIsGamePad &&
-			GetFloat(g.pointerLeft ? g.triggerLeft : g.triggerRight) > 0.5f;
+		const bool press = hit && g.screenIsGamePad && triggerValue > 0.5f;
 		if (press)
 		{
 			g.touchX = std::clamp((sint32)std::lround(u * (float)g.extent.width), 0, (sint32)g.extent.width - 1);
 			g.touchY = std::clamp((sint32)std::lround(v * (float)g.extent.height), 0, (sint32)g.extent.height - 1);
 			NativeInput::OnTouchEvent(g.touchX, g.touchY, false, true);
 			if (!g.touchActive)
+			{
 				LOGI("stylus down at %d,%d", g.touchX, g.touchY);
+				TriggerStylusHaptic();
+			}
 			g.touchActive = true;
 		}
 		else if (g.touchActive)
@@ -1077,10 +1182,10 @@ namespace VrRuntime
 		}
 	}
 
-	void UpdateScreenView()
+	void UpdateScreenView(bool bothGripsPressed)
 	{
 		// Holding both grips for ~0.7 s toggles between the TV and GamePad screen.
-		const bool bothGrips = GetFloat(g.squeezeLeft) > 0.5f && GetFloat(g.squeezeRight) > 0.5f;
+		const bool bothGrips = bothGripsPressed;
 		const auto now = std::chrono::steady_clock::now();
 		if (!bothGrips)
 		{
@@ -1146,18 +1251,20 @@ namespace VrRuntime
 			g.controllerInitialized = true;
 		}
 
+		const InputSnapshot in = ReadInputSnapshot();
+
 		using ButtonId = VPADController::ButtonId;
-		controller.SetButtonValue(ButtonId::kButtonId_A, GetBool(g.buttonA));
-		controller.SetButtonValue(ButtonId::kButtonId_B, GetBool(g.buttonB));
-		controller.SetButtonValue(ButtonId::kButtonId_X, GetBool(g.buttonX));
-		controller.SetButtonValue(ButtonId::kButtonId_Y, GetBool(g.buttonY));
-		controller.SetButtonValue(ButtonId::kButtonId_ZL, GetFloat(g.triggerLeft) > 0.5f);
-		controller.SetButtonValue(ButtonId::kButtonId_ZR, GetFloat(g.triggerRight) > 0.5f);
-		controller.SetButtonValue(ButtonId::kButtonId_L, GetFloat(g.squeezeLeft) > 0.5f);
-		controller.SetButtonValue(ButtonId::kButtonId_R, GetFloat(g.squeezeRight) > 0.5f);
-		controller.SetButtonValue(ButtonId::kButtonId_Plus, GetBool(g.menuButton));
-		controller.SetButtonValue(ButtonId::kButtonId_StickL, GetBool(g.stickClickLeft));
-		controller.SetButtonValue(ButtonId::kButtonId_StickR, GetBool(g.stickClickRight));
+		controller.SetButtonValue(ButtonId::kButtonId_A, in.a);
+		controller.SetButtonValue(ButtonId::kButtonId_B, in.b);
+		controller.SetButtonValue(ButtonId::kButtonId_X, in.x);
+		controller.SetButtonValue(ButtonId::kButtonId_Y, in.y);
+		controller.SetButtonValue(ButtonId::kButtonId_ZL, in.triggerL > 0.5f);
+		controller.SetButtonValue(ButtonId::kButtonId_ZR, in.triggerR > 0.5f);
+		controller.SetButtonValue(ButtonId::kButtonId_L, in.squeezeL > 0.5f);
+		controller.SetButtonValue(ButtonId::kButtonId_R, in.squeezeR > 0.5f);
+		controller.SetButtonValue(ButtonId::kButtonId_Plus, in.menu);
+		controller.SetButtonValue(ButtonId::kButtonId_StickL, in.stickClickL);
+		controller.SetButtonValue(ButtonId::kButtonId_StickR, in.stickClickR);
 
 		static int inputLogCount = 0;
 		static auto lastInputLog = std::chrono::steady_clock::now();
@@ -1166,7 +1273,7 @@ namespace VrRuntime
 		{
 			lastInputLog = inputNow;
 			inputLogCount++;
-			const XrVector2f ls = GetVector2(g.thumbstickLeft), rs = GetVector2(g.thumbstickRight);
+			const XrVector2f ls = in.stickL, rs = in.stickR;
 			char leftProfile[256] = "<none>", rightProfile[256] = "<none>";
 			uint32_t length = 0;
 			for (int hand = 0; hand < 2; hand++)
@@ -1180,9 +1287,9 @@ namespace VrRuntime
 						hand == 0 ? leftProfile : rightProfile);
 			}
 			LOGI("input state (sync=%d): A=%d B=%d X=%d Y=%d menu=%d TL=%.2f TR=%.2f SL=%.2f SR=%.2f L=(%.2f,%.2f) R=(%.2f,%.2f) profiles=%s|%s",
-				g.lastSyncResult.load(), GetBool(g.buttonA), GetBool(g.buttonB), GetBool(g.buttonX), GetBool(g.buttonY),
-				GetBool(g.menuButton), GetFloat(g.triggerLeft), GetFloat(g.triggerRight),
-				GetFloat(g.squeezeLeft), GetFloat(g.squeezeRight), ls.x, ls.y, rs.x, rs.y,
+				g.lastSyncResult.load(), in.a, in.b, in.x, in.y,
+				in.menu, in.triggerL, in.triggerR,
+				in.squeezeL, in.squeezeR, ls.x, ls.y, rs.x, rs.y,
 				leftProfile, rightProfile);
 		}
 
@@ -1190,11 +1297,11 @@ namespace VrRuntime
 		{
 			static bool prevA = false, prevB = false, prevX = false, prevY = false, prevMenu = false;
 			static bool prevTL = false, prevTR = false, prevSL = false, prevSR = false;
-			const bool curA = GetBool(g.buttonA), curB = GetBool(g.buttonB);
-			const bool curX = GetBool(g.buttonX), curY = GetBool(g.buttonY);
-			const bool curMenu = GetBool(g.menuButton);
-			const bool curTL = GetFloat(g.triggerLeft) > 0.5f, curTR = GetFloat(g.triggerRight) > 0.5f;
-			const bool curSL = GetFloat(g.squeezeLeft) > 0.5f, curSR = GetFloat(g.squeezeRight) > 0.5f;
+			const bool curA = in.a, curB = in.b;
+			const bool curX = in.x, curY = in.y;
+			const bool curMenu = in.menu;
+			const bool curTL = in.triggerL > 0.5f, curTR = in.triggerR > 0.5f;
+			const bool curSL = in.squeezeL > 0.5f, curSR = in.squeezeR > 0.5f;
 			auto edge = [](bool now, bool& prev, const char* name) {
 				if (now && !prev)
 					LOGI("input event: %s", name);
@@ -1206,8 +1313,8 @@ namespace VrRuntime
 		}
 
 		// Exit gesture: press both thumbsticks.
-		const bool stickL = GetBool(g.stickClickLeft);
-		const bool stickR = GetBool(g.stickClickRight);
+		const bool stickL = in.stickClickL;
+		const bool stickR = in.stickClickR;
 		if (stickL && stickR && !g.exitChordLatched)
 		{
 			g.userExitRequested = true;
@@ -1222,14 +1329,12 @@ namespace VrRuntime
 		static bool inputSeen = false;
 		if (!inputSeen)
 		{
-			const bool a = GetBool(g.buttonA), b = GetBool(g.buttonB), x = GetBool(g.buttonX), y = GetBool(g.buttonY);
-			const bool menu = GetBool(g.menuButton);
-			const XrVector2f ls = GetVector2(g.thumbstickLeft), rs = GetVector2(g.thumbstickRight);
-			if (a || b || x || y || menu || stickL || stickR ||
-				std::abs(ls.x) > 0.2f || std::abs(ls.y) > 0.2f || std::abs(rs.x) > 0.2f || std::abs(rs.y) > 0.2f)
+			if (in.a || in.b || in.x || in.y || in.menu || stickL || stickR ||
+				std::abs(in.stickL.x) > 0.2f || std::abs(in.stickL.y) > 0.2f ||
+				std::abs(in.stickR.x) > 0.2f || std::abs(in.stickR.y) > 0.2f)
 			{
 				LOGI("Touch input received: A=%d B=%d X=%d Y=%d menu=%d L=(%.2f,%.2f) R=(%.2f,%.2f)",
-					a, b, x, y, menu, ls.x, ls.y, rs.x, rs.y);
+					in.a, in.b, in.x, in.y, in.menu, in.stickL.x, in.stickL.y, in.stickR.x, in.stickR.y);
 				inputSeen = true;
 			}
 		}
@@ -1241,13 +1346,13 @@ namespace VrRuntime
 			controller.SetAxisValue(up, std::max(0.0f, stick.y));
 			controller.SetAxisValue(down, std::max(0.0f, -stick.y));
 		};
-		applyStick(GetVector2(g.thumbstickLeft), ButtonId::kButtonId_StickL_Left, ButtonId::kButtonId_StickL_Right,
+		applyStick(in.stickL, ButtonId::kButtonId_StickL_Left, ButtonId::kButtonId_StickL_Right,
 		           ButtonId::kButtonId_StickL_Up, ButtonId::kButtonId_StickL_Down);
-		applyStick(GetVector2(g.thumbstickRight), ButtonId::kButtonId_StickR_Left, ButtonId::kButtonId_StickR_Right,
+		applyStick(in.stickR, ButtonId::kButtonId_StickR_Left, ButtonId::kButtonId_StickR_Right,
 		           ButtonId::kButtonId_StickR_Up, ButtonId::kButtonId_StickR_Down);
 
-		UpdateScreenTouch(displayTime);
-		UpdateScreenView();
+		UpdateScreenTouch(displayTime, g.pointerLeft ? in.triggerL : in.triggerR);
+		UpdateScreenView(in.squeezeL > 0.5f && in.squeezeR > 0.5f);
 	}
 
 	bool ConsumeExitRequest()
@@ -1272,6 +1377,16 @@ namespace VrRuntime
 		g.sessionStateCv.notify_all();
 		if (g.eventThread.joinable())
 			g.eventThread.join();
+		// Present no longer blocks after submit, so drain any in-flight
+		// blit before the session (and soon the VkDevice) goes away.
+		if (g.vkDevice != VK_NULL_HANDLE)
+		{
+			for (VkFence fence : g.frameFences)
+			{
+				if (fence != VK_NULL_HANDLE)
+					vkWaitForFences(g.vkDevice, 1, &fence, VK_TRUE, 100'000'000);
+			}
+		}
 		if (g.sessionRunning)
 		{
 			xrEndSession(g.session);
@@ -1336,6 +1451,15 @@ namespace VrRuntime
 			xrEndFrame(g.session, &endInfo);
 		};
 
+		if (!frameState.shouldRender)
+		{
+			// The compositor does not want a layer this frame (throttling,
+			// not visible). Skip the blit entirely instead of presenting
+			// work nobody will display.
+			endEmptyFrame();
+			return false;
+		}
+
 		XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
 		uint32_t imageIndex = 0;
 		if (XR_FAILED(xrAcquireSwapchainImage(g.swapchain, &acquireInfo, &imageIndex)))
@@ -1352,14 +1476,20 @@ namespace VrRuntime
 			return false;
 		}
 
-		// Blit the emulator frame into the OpenXR image.
-		vkWaitForFences(g.vkDevice, 1, &g.frameFence, VK_TRUE, UINT64_MAX);
-		vkResetFences(g.vkDevice, 1, &g.frameFence);
-		vkResetCommandBuffer(g.commandBuffer, 0);
+		// Blit the emulator frame into the OpenXR image. Two slots rotate:
+		// wait only for this slot's previous submission (two frames ago),
+		// and never block after submitting (see below).
+		const uint32_t slot = g.frameSlot;
+		g.frameSlot = (g.frameSlot + 1) % (uint32_t)g.commandBuffers.size();
+		const VkCommandBuffer commandBuffer = g.commandBuffers[slot];
+		const VkFence frameFence = g.frameFences[slot];
+		vkWaitForFences(g.vkDevice, 1, &frameFence, VK_TRUE, UINT64_MAX);
+		vkResetFences(g.vkDevice, 1, &frameFence);
+		vkResetCommandBuffer(commandBuffer, 0);
 
 		VkCommandBufferBeginInfo bufferBegin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 		bufferBegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-		vkBeginCommandBuffer(g.commandBuffer, &bufferBegin);
+		vkBeginCommandBuffer(commandBuffer, &bufferBegin);
 
 		VkImageMemoryBarrier barriers[2]{};
 		barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1382,7 +1512,7 @@ namespace VrRuntime
 		barriers[1].srcAccessMask = 0;
 		barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 
-		vkCmdPipelineBarrier(g.commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 			0, 0, nullptr, 0, nullptr, 2, barriers);
 
 		VkImageBlit region{};
@@ -1390,7 +1520,7 @@ namespace VrRuntime
 		region.srcOffsets[1] = {(int32_t)g.extent.width, (int32_t)g.extent.height, 1};
 		region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 		region.dstOffsets[1] = {(int32_t)g.swapchainWidth, (int32_t)g.swapchainHeight, 1};
-		vkCmdBlitImage(g.commandBuffer,
+		vkCmdBlitImage(commandBuffer,
 			sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 			g.swapchainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			1, &region, VK_FILTER_LINEAR);
@@ -1423,20 +1553,20 @@ namespace VrRuntime
 				toAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 				toAttachment.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 				toAttachment.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-				vkCmdPipelineBarrier(g.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
 					VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toAttachment);
 
 				VkRenderPassBeginInfo passBegin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
 				passBegin.renderPass = g.cursorRenderPass;
 				passBegin.framebuffer = g.cursorFramebuffers[imageIndex];
 				passBegin.renderArea = {{0, 0}, {g.swapchainWidth, g.swapchainHeight}};
-				vkCmdBeginRenderPass(g.commandBuffer, &passBegin, VK_SUBPASS_CONTENTS_INLINE);
+				vkCmdBeginRenderPass(commandBuffer, &passBegin, VK_SUBPASS_CONTENTS_INLINE);
 
 				const VkViewport viewport{0.0f, 0.0f, (float)g.swapchainWidth, (float)g.swapchainHeight, 0.0f, 1.0f};
 				const VkRect2D scissor{{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
-				vkCmdSetViewport(g.commandBuffer, 0, 1, &viewport);
-				vkCmdSetScissor(g.commandBuffer, 0, 1, &scissor);
-				vkCmdBindPipeline(g.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g.cursorPipeline);
+				vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+				vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+				vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g.cursorPipeline);
 
 				CursorPushConstants push{};
 				push.centerX = centerX;
@@ -1445,11 +1575,11 @@ namespace VrRuntime
 				push.innerRadius = innerRadius;
 				push.opacity = 0.55f;
 				push.pressed = g.touchActive ? 1.0f : 0.0f;
-				vkCmdPushConstants(g.commandBuffer, g.cursorPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+				vkCmdPushConstants(commandBuffer, g.cursorPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
 					0, sizeof(push), &push);
 
-				vkCmdDraw(g.commandBuffer, 3, 1, 0, 0);
-				vkCmdEndRenderPass(g.commandBuffer);
+				vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+				vkCmdEndRenderPass(commandBuffer);
 				cursorDrawn = true;
 			}
 		}
@@ -1459,11 +1589,11 @@ namespace VrRuntime
 		toSampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 		toSampled.srcAccessMask = cursorDrawn ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
 		toSampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		vkCmdPipelineBarrier(g.commandBuffer,
+		vkCmdPipelineBarrier(commandBuffer,
 			cursorDrawn ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
 			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSampled);
 
-		vkEndCommandBuffer(g.commandBuffer);
+		vkEndCommandBuffer(commandBuffer);
 
 		VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
 		submit.waitSemaphoreCount = 1;
@@ -1471,13 +1601,16 @@ namespace VrRuntime
 		VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 		submit.pWaitDstStageMask = &waitStage;
 		submit.commandBufferCount = 1;
-		submit.pCommandBuffers = &g.commandBuffer;
-		if (vkQueueSubmit(g.queue, 1, &submit, g.frameFence) != VK_SUCCESS)
+		submit.pCommandBuffers = &commandBuffer;
+		if (vkQueueSubmit(g.queue, 1, &submit, frameFence) != VK_SUCCESS)
 		{
 			endEmptyFrame();
 			return false;
 		}
-		vkWaitForFences(g.vkDevice, 1, &g.frameFence, VK_TRUE, UINT64_MAX);
+		// No CPU wait here: the blit stays queued on the same VkQueue the
+		// runtime binds the session to, and this slot's fence is waited on
+		// when the slot rotates back (two frames later). Blocking here used
+		// to idle the render thread until the GPU finished every frame.
 
 		XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 		if (XR_FAILED(xrReleaseSwapchainImage(g.swapchain, &releaseInfo)))
@@ -1515,6 +1648,45 @@ namespace VrRuntime
 		if (frameCounter == 1)
 			LOGI("first VR frame submitted");
 		const auto now = std::chrono::steady_clock::now();
+
+		// Once-per-second frame-interval histogram. The 5 s average below
+		// hides hitches; percentiles expose them. Intervals over two 60 Hz
+		// periods count as dropped, and pauses (>250 ms) start a new sample
+		// instead of polluting the window.
+		if (!g.haveLastFrame)
+		{
+			g.haveLastFrame = true;
+			g.frameStatsWindowStart = now;
+			g.frameIntervalsMs.reserve(128);
+		}
+		else
+		{
+			const float intervalMs = std::chrono::duration<float, std::milli>(now - g.lastFrameAt).count();
+			if (intervalMs <= 250.0f)
+			{
+				g.frameIntervalsMs.push_back(intervalMs);
+				if (intervalMs > 33.4f)
+					g.droppedInWindow++;
+			}
+			if (now - g.frameStatsWindowStart >= std::chrono::seconds(1) && !g.frameIntervalsMs.empty())
+			{
+				std::vector<float> sorted = g.frameIntervalsMs;
+				std::sort(sorted.begin(), sorted.end());
+				auto percentile = [&sorted](float p) {
+					const size_t idx = std::min(sorted.size() - 1,
+						(size_t)std::floor(p * (float)(sorted.size() - 1)));
+					return sorted[idx];
+				};
+				LOGI("VR frame time: n=%zu p50=%.2fms p95=%.2fms p99=%.2fms max=%.2fms dropped=%u",
+					sorted.size(), percentile(0.50f), percentile(0.95f), percentile(0.99f),
+					sorted.back(), g.droppedInWindow);
+				g.frameIntervalsMs.clear();
+				g.droppedInWindow = 0;
+				g.frameStatsWindowStart = now;
+			}
+		}
+		g.lastFrameAt = now;
+
 		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastReport).count();
 		if (elapsed >= 5000)
 		{
@@ -1606,6 +1778,27 @@ bool VrInitializeAndroid(JNIEnv* env, jobject context)
 	systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
 	if (!XrOk(xrGetSystem(g.instance, &systemInfo, &g.systemId), "xrGetSystem"))
 		return false;
+
+	{
+		uint32_t viewCount = 0;
+		if (XrOk(xrEnumerateViewConfigurationViews(g.instance, g.systemId,
+				XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount, nullptr),
+				"xrEnumerateViewConfigurationViews(count)") && viewCount > 0)
+		{
+			std::vector<XrViewConfigurationView> views(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+			if (XrOk(xrEnumerateViewConfigurationViews(g.instance, g.systemId,
+					XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount, &viewCount, views.data()),
+					"xrEnumerateViewConfigurationViews"))
+			{
+				g.recommendedWidth = views[0].recommendedImageRectWidth;
+				g.recommendedHeight = views[0].recommendedImageRectHeight;
+				g.maxWidth = views[0].maxImageRectWidth;
+				g.maxHeight = views[0].maxImageRectHeight;
+				LOGI("view config: recommended %ux%u max %ux%u per eye (%u views)",
+					g.recommendedWidth, g.recommendedHeight, g.maxWidth, g.maxHeight, viewCount);
+			}
+		}
+	}
 
 	// Required by the runtime before xrCreateSession can use the Vulkan binding.
 	XrGraphicsRequirementsVulkanKHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};

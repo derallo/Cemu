@@ -266,7 +266,7 @@ Java_info_cemu_cemu_nativeinterface_NativeSettings_getFullscreenScaling([[maybe_
 extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
 Java_info_cemu_cemu_nativeinterface_NativeSettings_setVrRenderScale([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz, jint scale)
 {
-	GetConfig().vr_render_scale = std::clamp(static_cast<sint32>(scale), 100, 200);
+	GetConfig().vr_render_scale = std::clamp(static_cast<sint32>(scale), 0, 200);
 }
 
 extern "C" [[maybe_unused]] JNIEXPORT jint JNICALL

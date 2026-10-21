@@ -61,8 +61,9 @@ object NativeSettings {
     @JvmStatic
     external fun setDownscalingFilter(value: Int)
 
-    /** VR presentation resolution as a percentage of 1280x720. */
+    /** VR presentation resolution as a percentage of 1280x720; 0 = runtime-recommended. */
     object VrRenderScale {
+        const val AUTO: Int = 0
         const val PERCENT_100: Int = 100
         const val PERCENT_125: Int = 125
         const val PERCENT_150: Int = 150
